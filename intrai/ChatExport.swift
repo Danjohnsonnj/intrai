@@ -31,19 +31,4 @@ struct ChatExport {
 
         return lines.joined(separator: "\n")
     }
-
-    static func temporaryMarkdownFileURL(for session: ChatSession) throws -> URL {
-        let markdown = markdown(for: session)
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let filename = sanitizeFilename("\(session.title)-\(timestamp)") + ".md"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
-        try markdown.write(to: url, atomically: true, encoding: .utf8)
-        return url
-    }
-
-    private static func sanitizeFilename(_ raw: String) -> String {
-        let invalid = CharacterSet(charactersIn: "\\/:*?\"<>|")
-        let pieces = raw.components(separatedBy: invalid)
-        return pieces.joined(separator: "-")
-    }
 }

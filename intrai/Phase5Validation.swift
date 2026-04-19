@@ -29,9 +29,5 @@ enum Phase5Validation {
         assert(markdown.contains("### Assistant"), "Markdown should contain assistant role heading")
         assert(markdown.contains("Hello"), "Markdown should include user message text")
         assert(markdown.contains("Hi there"), "Markdown should include assistant message text")
-
-        let url = try! ChatExport.temporaryMarkdownFileURL(for: session)
-        let fileContents = try! String(contentsOf: url, encoding: .utf8)
-        assert(fileContents == markdown, "Exported file should match generated markdown")
     }
 }

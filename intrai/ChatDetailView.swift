@@ -17,8 +17,6 @@ struct ChatDetailView: View {
 
     @State private var draftMessage = ""
     @State private var showingSnapshotSheet = false
-    @State private var shareItem: ShareItem?
-    @State private var exportErrorText: String?
 
     private var orderedMessages: [ChatMessage] {
         session.messages.sorted { $0.timestamp < $1.timestamp }
@@ -118,7 +116,7 @@ struct ChatDetailView: View {
                     Button {
                         exportMarkdown()
                     } label: {
-                        Label("Export Markdown", systemImage: "square.and.arrow.up")
+                        Label("Copy as Markdown", systemImage: "doc.on.clipboard")
                     }
                 } label: {
                     Label("Chat Actions", systemImage: "ellipsis.circle")
@@ -127,16 +125,6 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingSnapshotSheet) {
             SessionSnapshotView(session: session)
-        }
-        .sheet(item: $shareItem) { item in
-            ShareSheet(activityItems: [item.url])
-        }
-        .alert("Export Failed", isPresented: exportErrorBinding) {
-            Button("OK", role: .cancel) {
-                exportErrorText = nil
-            }
-        } message: {
-            Text(exportErrorText ?? "Unable to export markdown.")
         }
         .onDisappear {
             cancelCurrentGeneration()
@@ -157,30 +145,9 @@ struct ChatDetailView: View {
         intelligenceService.cancelGeneration(in: session)
     }
 
-    private var exportErrorBinding: Binding<Bool> {
-        Binding(
-            get: { exportErrorText != nil },
-            set: { isPresented in
-                if !isPresented {
-                    exportErrorText = nil
-                }
-            }
-        )
-    }
-
     private func exportMarkdown() {
-        do {
-            let url = try ChatExport.temporaryMarkdownFileURL(for: session)
-            shareItem = ShareItem(url: url)
-        } catch {
-            exportErrorText = error.localizedDescription
-        }
+        UIPasteboard.general.string = ChatExport.markdown(for: session)
     }
-}
-
-private struct ShareItem: Identifiable {
-    let id = UUID()
-    let url: URL
 }
 
 private struct SessionSnapshotView: View {
@@ -297,16 +264,3 @@ private struct ChatMessageBubble: View {
         }
     }
 }
-
-#if canImport(UIKit)
-private struct ShareSheet: UIViewControllerRepresentable {
-    let activityItems: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {
-    }
-}
-#endif
