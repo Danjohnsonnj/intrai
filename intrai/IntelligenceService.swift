@@ -179,6 +179,7 @@ final class IntelligenceService: ObservableObject {
 
                 try modelContext.save()
                 self.lastFailedPromptBySessionID[sessionID] = nil
+                await self.autoNameIfNeeded(session: session, firstUserText: prompt, modelContext: modelContext)
             } catch is CancellationError {
                 if let assistantMessage {
                     session.messages.removeAll { $0.id == assistantMessage.id }
@@ -229,6 +230,50 @@ final class IntelligenceService: ObservableObject {
 
     private func cancelActiveGenerationIfAny(in session: ChatSession) {
         activeTasksBySessionID[session.id]?.cancel()
+    }
+
+    private func autoNameIfNeeded(session: ChatSession, firstUserText: String, modelContext: ModelContext) async {
+        // Only rename sessions that still have the default title and have exactly
+        // one user message + one assistant message (i.e. the very first exchange).
+        guard session.title == "New Chat",
+              session.messages.count == 2 else { return }
+
+        let fallback = "✦ " + firstUserText
+            .split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
+            .prefix(5)
+            .joined(separator: " ")
+
+#if canImport(FoundationModels)
+        let model = SystemLanguageModel.default
+        guard case .available = model.availability else {
+            session.title = fallback
+            try? modelContext.save()
+            return
+        }
+
+        let assistantText = session.messages
+            .filter { $0.validatedRole == .assistant }
+            .sorted { $0.timestamp < $1.timestamp }
+            .first?.text ?? ""
+
+        let systemInstruction = "Generate a title for this conversation in fewer than 6 words. Respond with the title only, no quotes or punctuation."
+        let namingPrompt = "User: \(firstUserText)\nAssistant: \(assistantText)"
+
+        do {
+            let namingSession = LanguageModelSession(instructions: systemInstruction)
+            let response = try await namingSession.respond(to: namingPrompt)
+            let trimmed = response.content
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'."))
+            session.title = trimmed.isEmpty ? fallback : "✦ " + trimmed
+        } catch {
+            session.title = fallback
+        }
+        try? modelContext.save()
+#else
+        session.title = fallback
+        try? modelContext.save()
+#endif
     }
 
     private func isDisplayableFragment(_ fragment: String) -> Bool {

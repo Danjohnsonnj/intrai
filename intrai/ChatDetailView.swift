@@ -18,6 +18,9 @@ struct ChatDetailView: View {
     @State private var draftMessage = ""
     @State private var showingSnapshotSheet = false
     @FocusState private var isInputFocused: Bool
+    @State private var showingRenameAlert = false
+    @State private var renameDraft = ""
+    @State private var wasInputFocused = false
 
     private var orderedMessages: [ChatMessage] {
         session.messages.sorted { $0.timestamp < $1.timestamp }
@@ -122,6 +125,16 @@ struct ChatDetailView: View {
         .navigationTitle(session.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(session.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .onLongPressGesture {
+                        wasInputFocused = isInputFocused
+                        renameDraft = session.title
+                        showingRenameAlert = true
+                    }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button {
@@ -142,6 +155,24 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingSnapshotSheet) {
             SessionSnapshotView(session: session)
+        }
+        .alert("Rename Chat", isPresented: $showingRenameAlert) {
+            TextField("Title", text: $renameDraft)
+            Button("Save") {
+                let cleaned = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    session.title = cleaned
+                    try? modelContext.save()
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Choose a new title for this chat.")
+        }
+        .onChange(of: showingRenameAlert) { _, showing in
+            if !showing && wasInputFocused {
+                isInputFocused = true
+            }
         }
         .onDisappear {
             cancelCurrentGeneration()
