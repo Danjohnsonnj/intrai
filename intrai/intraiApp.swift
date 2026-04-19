@@ -2,8 +2,6 @@
 //  intraiApp.swift
 //  intrai
 //
-//  Created by Daniel Johnson on 4/18/26.
-//
 
 import SwiftUI
 import SwiftData
@@ -12,7 +10,9 @@ import SwiftData
 struct intraiApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            ChatSession.self,
+            ChatMessage.self,
+            UserMemory.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 

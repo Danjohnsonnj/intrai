@@ -1,0 +1,12 @@
+{
+	"servers": {
+		"xcode-tools": {
+			"type": "stdio",
+			"command": "xcrun",
+			"args": [
+				"mcpbridge"
+			]
+		}
+	},
+	"inputs": []
+}
