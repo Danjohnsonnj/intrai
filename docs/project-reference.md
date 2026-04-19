@@ -10,7 +10,7 @@ Users maintain multiple independent chat threads. Each thread has a "baked-in" s
 
 ## Current Status
 
-All six MVP phases are complete and committed.
+All six MVP phases are complete and committed. Post-MVP improvements have also been shipped.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
@@ -21,15 +21,26 @@ All six MVP phases are complete and committed.
 | 4 | Memory & prompt management UX | ✅ Complete |
 | 5 | Markdown export & sharing | ✅ Complete |
 | 6 | Error handling, cancellation & stabilization | ✅ Complete |
+| Post-MVP | Auto-naming, rename, MarkdownUI, clipboard export, Siri, input clear fix | ✅ Complete |
 
 ---
 
 ## Functional Capabilities
 
 ### Multi-Session Chat
-- Create, rename (swipe-left), and delete (swipe-right) sessions via a `NavigationSplitView` sidebar.
+- Create, rename (swipe-left or long-press title in chat view), and delete (swipe-right) sessions via a `NavigationSplitView` sidebar.
 - Sessions are sorted reverse-chronologically.
 - Deleting a session cascade-deletes all associated messages.
+
+### Auto-Naming
+- After the first user message and assistant response, `IntelligenceService.autoNameIfNeeded()` generates a concise title using a separate `LanguageModelSession`.
+- The title is prefixed with `✦ `. Fallback (on model error) is `"✦ " + first 5 words of the user message`.
+- Guard: only fires when `session.title == "New Chat" && session.messages.count == 2`.
+
+### In-Chat Rename
+- Long-pressing the `.principal` toolbar title in `ChatDetailView` presents a rename alert pre-filled with the current title.
+- On save, `session.title` is updated directly and `modelContext.save()` is called.
+- If the keyboard was focused before the rename, focus is restored after the alert dismisses.
 
 ### Streaming AI Responses
 - `IntelligenceService` streams responses from `SystemLanguageModel.default` via `LanguageModelSession`.
@@ -45,12 +56,20 @@ All six MVP phases are complete and committed.
 - Refresh history tracked: `snapshotVersion`, `lastSnapshotRefreshAt`, `snapshotRefreshReason`.
 
 ### Markdown Rendering
-- Chat bubbles render inline Markdown via `AttributedString(markdown:)`.
-- Text is selectable.
+- Assistant message bubbles render full block Markdown via [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) 2.4.1 (`MarkdownUI` product, SPM).
+- Theme: `.gitHub` with `.primary` foreground and neutral code-block background for readability on coloured bubbles in light and dark mode.
+- User messages remain plain `Text` (user input is never Markdown).
+- Text is selectable in both branches.
 
 ### Markdown Export
-- `ChatExport` serializes a session to a structured `.md` file (title, date, conversation with role headings).
-- The file is written to the system temp directory and shared via `UIActivityViewController`.
+- `ChatExport.markdown(for:)` serializes a session to a structured Markdown string (title, date, messages with role headings).
+- Tapping "Copy as Markdown" in the chat action menu writes the string to `UIPasteboard.general.string`. No file is created; no Share Sheet is shown.
+
+### Siri / App Intents
+- `AskIntraiIntent` (`AppIntent`) is registered with `openAppWhenRun = true`.
+- Trigger phrase: "Hey Siri, ask Intrai" — Siri follows up with "What would you like to ask Intrai?" for free-form input (Apple's `AppShortcutsProvider` only supports `AppEntity`/`AppEnum` in phrase interpolation, not raw `String`).
+- `IntraiShortcuts` (`AppShortcutsProvider`) registers the intent in Settings › Siri & Search and the Shortcuts app automatically — no user setup required.
+- `PendingIntentStore` is an `@Observable` singleton that holds the incoming question. `ContentView` observes it via `.onAppear` (cold-launch) and `.onChange` (foregrounded), then calls `addSession()` + `intelligenceService.send()`.
 
 ### Error Handling & Retry
 - Typed `IntelligenceError` enum: `.emptyPrompt`, `.unavailableModel`, `.generationCancelled`.
@@ -65,6 +84,8 @@ All six MVP phases are complete and committed.
 ### Architecture Pattern
 SwiftUI + SwiftData + a `@MainActor` service layer. Views interact directly with an `@ObservedObject` `IntelligenceService` and the SwiftData `ModelContext`. No MVVM wrapper layer.
 
+One external dependency: [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) 2.4.1, added via SPM (`MarkdownUI` product, iOS 15+ compatible).
+
 ### Source Files
 
 | File | Role |
@@ -75,10 +96,12 @@ SwiftUI + SwiftData + a `@MainActor` service layer. Views interact directly with
 | `UserMemory.swift` | `@Model` — singleton global memory; `fetch(from:)` load-or-create pattern |
 | `SnapshotBuilder.swift` | Pure function — composes system prompt + memory facts into a snapshot string |
 | `AIContextBuilder.swift` | Pure function — builds an ordered role-prefixed transcript from session messages |
-| `IntelligenceService.swift` | `@MainActor ObservableObject` — generation lifecycle, task tracking, cancellation, retry, error mapping |
-| `ContentView.swift` | Session list sidebar + `MemorySettingsView` (system prompt & facts editor) |
-| `ChatDetailView.swift` | Message timeline, composer, cancel button, snapshot inspector, markdown export |
-| `ChatExport.swift` | Markdown serialization + sanitized temp file writer |
+| `IntelligenceService.swift` | `@MainActor ObservableObject` — generation lifecycle, task tracking, cancellation, retry, auto-naming |
+| `PendingIntentStore.swift` | `@Observable` singleton — holds incoming Siri/App Intent question; observed by `ContentView` |
+| `SiriIntents.swift` | `AskIntraiIntent` + `IntraiShortcuts` (`AppShortcutsProvider`) |
+| `ContentView.swift` | Session list sidebar, `MemorySettingsView`, App Intent handler |
+| `ChatDetailView.swift` | Message timeline, composer, long-press rename, action menu (copy markdown, snapshot) |
+| `ChatExport.swift` | Markdown serialization |
 
 ### Data Models
 
@@ -90,7 +113,7 @@ var createdAt: Date
 var systemPromptSnapshot: String     // Frozen at creation
 var snapshotVersion: Int
 var lastSnapshotRefreshAt: Date?
-var snapshotRefreshReason: String?
+var snapshotRefreshReason: String?   // Pending removal
 @Relationship(deleteRule: .cascade)
 var messages: [ChatMessage]
 ```
@@ -154,10 +177,13 @@ UserMemory.systemPrompt + UserMemory.facts
 | `ChatResponding` protocol | Decouples the AI provider from generation lifecycle logic; enables mock-based validation without `FoundationModels` |
 | `#if canImport(FoundationModels)` guards | Project compiles and runs on simulators and CI targets that don't have the framework |
 | Snapshot is immutable by default | Preserves the "persistent identity" contract — the AI you created the session with is the AI it uses throughout |
-| Per-session refresh requires a reason string | Forces intentionality; reason is persisted for auditability |
+| Per-session refresh requires confirmation | Forces intentionality; refresh history tracked via `snapshotVersion` and `lastSnapshotRefreshAt` |
 | `UserMemory` singleton via `fetch(from:)` | Avoids duplicating global state; safe to call from any view with a `ModelContext` |
 | `@MainActor` on `IntelligenceService` | All published state mutations happen on the main actor; no manual `DispatchQueue.main` calls needed |
 | `defer` for generation state cleanup | Guarantees `generatingSessionIDs` and `activeTasksBySessionID` are cleaned up even if the task throws or is cancelled |
+| Generation stamp UUIDs | Prevents a defer race when rapid successive messages are sent; only the current generation's stamp matches |
+| MarkdownUI for assistant bubbles | Full block-level rendering (code blocks, headings, lists) is not achievable with `AttributedString` alone |
+| `PendingIntentStore` `@Observable` singleton | App Intents execute outside SwiftUI's environment; a singleton observable bridges intent → view without requiring Environment injection or NotificationCenter |
 
 ---
 
@@ -171,3 +197,7 @@ Per the product brief, the following are explicitly deferred:
 - Rich attachments (images, files)
 - Cloud routing configuration UI (PCC routing is automatic and Apple-managed)
 - Formal XCTest target (executable validation snippets exist per phase)
+
+## Known Pending Items
+
+- `snapshotRefreshReason: String?` — field still present in `ChatSession` model and `SessionSnapshotView`; scheduled for removal (SwiftData lightweight migration handles field removal automatically)

@@ -11,6 +11,7 @@ struct ContentView: View {
     @Query(sort: \ChatSession.createdAt, order: .reverse) private var sessions: [ChatSession]
 
     @StateObject private var intelligenceService = IntelligenceService()
+    @State private var intentStore = PendingIntentStore.shared
     @State private var selectedSessionID: UUID?
     @State private var renameSessionID: UUID?
     @State private var renameDraftTitle = ""
@@ -25,50 +26,7 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(selection: $selectedSessionID) {
-                ForEach(sessions, id: \.id) { session in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(session.title)
-                            .font(.headline)
-                            .lineLimit(1)
-
-                        Text(session.createdAt, format: .dateTime)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .tag(session.id)
-                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                        Button(role: .destructive) {
-                            deleteSession(session)
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                    }
-                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                        Button {
-                            beginRename(session)
-                        } label: {
-                            Label("Rename", systemImage: "pencil")
-                        }
-                        .tint(.blue)
-                    }
-                }
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        showingMemorySettings = true
-                    } label: {
-                        Label("Memory Settings", systemImage: "brain")
-                    }
-                }
-                ToolbarItem {
-                    Button(action: addSession) {
-                        Label("New Chat", systemImage: "plus")
-                    }
-                }
-            }
-            .navigationTitle("Chats")
+            sidebar
         } detail: {
             if let selectedSession {
                 ChatDetailView(session: selectedSession, intelligenceService: intelligenceService)
@@ -89,6 +47,62 @@ struct ContentView: View {
         .sheet(isPresented: $showingMemorySettings) {
             MemorySettingsView()
         }
+        .onAppear {
+            handlePendingIntent()
+        }
+        .onChange(of: intentStore.pendingQuestion) {
+            handlePendingIntent()
+        }
+    }
+
+    @ViewBuilder
+    private var sidebar: some View {
+        List(selection: $selectedSessionID) {
+            ForEach(sessions, id: \.id) { session in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.title)
+                        .font(.headline)
+                        .lineLimit(1)
+
+                    Text(session.createdAt, format: .dateTime)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .tag(session.id)
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    Button(role: .destructive) {
+                        deleteSession(session)
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                }
+                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                    Button {
+                        beginRename(session)
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+                    .tint(.blue)
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showingMemorySettings = true
+                } label: {
+                    Label("Memory Settings", systemImage: "brain")
+                }
+            }
+            ToolbarItem {
+                Button {
+                    addSession()
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                }
+            }
+        }
+        .navigationTitle("Chats")
     }
 
     // MARK: - Helpers
@@ -105,14 +119,25 @@ struct ContentView: View {
         )
     }
 
-    private func addSession() {
+    @discardableResult
+    private func addSession() -> ChatSession {
+        let memory = UserMemory.fetch(from: modelContext)
+        let snapshot = SnapshotBuilder.compose(from: memory)
+        let session = ChatSession(title: "New Chat", systemPromptSnapshot: snapshot)
         withAnimation {
-            let memory = UserMemory.fetch(from: modelContext)
-            let snapshot = SnapshotBuilder.compose(from: memory)
-            let session = ChatSession(title: "New Chat", systemPromptSnapshot: snapshot)
             modelContext.insert(session)
             selectedSessionID = session.id
-            try? modelContext.save()
+        }
+        try? modelContext.save()
+        return session
+    }
+
+    private func handlePendingIntent() {
+        guard let question = intentStore.pendingQuestion else { return }
+        intentStore.pendingQuestion = nil
+        let session = addSession()
+        Task {
+            await intelligenceService.send(question, in: session, modelContext: modelContext)
         }
     }
 
