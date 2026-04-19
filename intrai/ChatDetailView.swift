@@ -17,6 +17,7 @@ struct ChatDetailView: View {
 
     @State private var draftMessage = ""
     @State private var showingSnapshotSheet = false
+    @FocusState private var isInputFocused: Bool
 
     private var orderedMessages: [ChatMessage] {
         session.messages.sorted { $0.timestamp < $1.timestamp }
@@ -51,12 +52,27 @@ struct ChatDetailView: View {
                                 .font(.footnote)
                             }
                             .padding(.vertical, 4)
+                            .id("generatingIndicator")
                         }
                     }
                     .padding(12)
                 }
                 .onChange(of: orderedMessages.count) { _, _ in
                     if let last = orderedMessages.last {
+                        withAnimation {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
+                    }
+                }
+                .onChange(of: isGenerating) { _, generating in
+                    if generating {
+                        withAnimation {
+                            proxy.scrollTo("generatingIndicator", anchor: .bottom)
+                        }
+                    }
+                }
+                .onChange(of: isInputFocused) { _, focused in
+                    if focused, let last = orderedMessages.last {
                         withAnimation {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
@@ -90,6 +106,7 @@ struct ChatDetailView: View {
                 TextField("Message", text: $draftMessage, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(1...5)
+                    .focused($isInputFocused)
 
                 Button {
                     sendCurrentDraft()
