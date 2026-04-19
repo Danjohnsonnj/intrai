@@ -36,7 +36,7 @@ struct LocalFirstChatResponder: ChatResponding {
     func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
 #if canImport(FoundationModels)
         AsyncThrowingStream { continuation in
-            Task {
+            let innerTask = Task {
                 do {
                     let model = SystemLanguageModel.default
                     switch model.availability {
@@ -61,6 +61,9 @@ struct LocalFirstChatResponder: ChatResponding {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in
+                innerTask.cancel()
+            }
         }
 #else
         AsyncThrowingStream { continuation in
@@ -78,6 +81,7 @@ final class IntelligenceService: ObservableObject {
     private var lastFailedPromptBySessionID: [UUID: String] = [:]
     private var activeTasksBySessionID: [UUID: Task<Void, Never>] = [:]
     private var pendingCancellationSessionIDs: Set<UUID> = []
+    private var generationStampsBySessionID: [UUID: UUID] = [:]
     private let responder: ChatResponding
 
     init(responder: ChatResponding = LocalFirstChatResponder()) {
@@ -123,6 +127,8 @@ final class IntelligenceService: ObservableObject {
         )
 
         let sessionID = session.id
+        let stamp = UUID()
+        generationStampsBySessionID[sessionID] = stamp
         let task = Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -131,8 +137,13 @@ final class IntelligenceService: ObservableObject {
             var assistantMessage: ChatMessage?
 
             defer {
-                self.generatingSessionIDs.remove(sessionID)
-                self.activeTasksBySessionID[sessionID] = nil
+                // Only clean up shared state if we are still the active generation.
+                // A newer send() may have already overwritten these entries.
+                if self.generationStampsBySessionID[sessionID] == stamp {
+                    self.generatingSessionIDs.remove(sessionID)
+                    self.activeTasksBySessionID[sessionID] = nil
+                    self.generationStampsBySessionID.removeValue(forKey: sessionID)
+                }
                 self.pendingCancellationSessionIDs.remove(sessionID)
             }
 
@@ -194,7 +205,6 @@ final class IntelligenceService: ObservableObject {
         if pendingCancellationSessionIDs.remove(sessionID) != nil {
             task.cancel()
         }
-        await task.value
     }
 
     func retry(in session: ChatSession, modelContext: ModelContext) async {
