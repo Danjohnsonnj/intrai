@@ -106,9 +106,6 @@ final class IntelligenceService: ObservableObject {
         let userMessage = ChatMessage(text: prompt, role: .user)
         session.messages.append(userMessage)
 
-        let assistantMessage = ChatMessage(text: "", role: .assistant)
-        session.messages.append(assistantMessage)
-
         do {
             try modelContext.save()
         } catch {
@@ -129,6 +126,8 @@ final class IntelligenceService: ObservableObject {
                 return
             }
 
+            var assistantMessage: ChatMessage?
+
             defer {
                 self.generatingSessionIDs.remove(sessionID)
                 self.activeTasksBySessionID[sessionID] = nil
@@ -137,22 +136,38 @@ final class IntelligenceService: ObservableObject {
             do {
                 for try await fragment in stream {
                     try Task.checkCancellation()
-                    assistantMessage.text += fragment
+
+                    if assistantMessage == nil,
+                       !fragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let message = ChatMessage(text: "", role: .assistant)
+                        session.messages.append(message)
+                        assistantMessage = message
+                    }
+
+                    assistantMessage?.text += fragment
                 }
 
-                if assistantMessage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    assistantMessage.text = "(No response generated.)"
+                if assistantMessage == nil {
+                    let message = ChatMessage(text: "(No response generated.)", role: .assistant)
+                    session.messages.append(message)
+                    assistantMessage = message
+                } else if assistantMessage?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                    assistantMessage?.text = "(No response generated.)"
                 }
 
                 try modelContext.save()
                 self.lastFailedPromptBySessionID[sessionID] = nil
             } catch is CancellationError {
-                session.messages.removeAll { $0.id == assistantMessage.id }
+                if let assistantMessage {
+                    session.messages.removeAll { $0.id == assistantMessage.id }
+                }
                 self.errorsBySessionID[sessionID] = IntelligenceError.generationCancelled.localizedDescription
                 self.lastFailedPromptBySessionID[sessionID] = prompt
                 try? modelContext.save()
             } catch {
-                session.messages.removeAll { $0.id == assistantMessage.id }
+                if let assistantMessage {
+                    session.messages.removeAll { $0.id == assistantMessage.id }
+                }
                 self.errorsBySessionID[sessionID] = self.friendlyErrorText(from: error)
                 self.lastFailedPromptBySessionID[sessionID] = prompt
 
