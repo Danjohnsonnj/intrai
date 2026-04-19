@@ -19,6 +19,7 @@ struct ChatDetailView: View {
     @State private var showingSnapshotSheet = false
     @State private var shareItem: ShareItem?
     @State private var exportErrorText: String?
+    @State private var currentGenerationTask: Task<Void, Never>?
 
     private var orderedMessages: [ChatMessage] {
         session.messages.sorted { $0.timestamp < $1.timestamp }
@@ -44,6 +45,13 @@ struct ChatDetailView: View {
                                 Text("Generating response...")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
+
+                                Spacer()
+
+                                Button("Cancel") {
+                                    cancelCurrentGeneration()
+                                }
+                                .font(.footnote)
                             }
                             .padding(.vertical, 4)
                         }
@@ -131,15 +139,26 @@ struct ChatDetailView: View {
         } message: {
             Text(exportErrorText ?? "Unable to export markdown.")
         }
+        .onDisappear {
+            cancelCurrentGeneration()
+        }
     }
 
     private func sendCurrentDraft() {
         let prompt = draftMessage
         draftMessage = ""
 
-        Task {
+        currentGenerationTask?.cancel()
+        currentGenerationTask = Task {
             await intelligenceService.send(prompt, in: session, modelContext: modelContext)
+            currentGenerationTask = nil
         }
+    }
+
+    private func cancelCurrentGeneration() {
+        currentGenerationTask?.cancel()
+        currentGenerationTask = nil
+        intelligenceService.cancelGeneration(in: session)
     }
 
     private var exportErrorBinding: Binding<Bool> {

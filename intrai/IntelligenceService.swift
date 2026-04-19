@@ -14,6 +14,7 @@ import FoundationModels
 enum IntelligenceError: LocalizedError {
     case emptyPrompt
     case unavailableModel(String)
+    case generationCancelled
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +22,8 @@ enum IntelligenceError: LocalizedError {
             return "The prompt is empty."
         case let .unavailableModel(reason):
             return reason
+        case .generationCancelled:
+            return "Generation cancelled."
         }
     }
 }
@@ -73,6 +76,7 @@ final class IntelligenceService: ObservableObject {
     @Published private(set) var errorsBySessionID: [UUID: String] = [:]
 
     private var lastFailedPromptBySessionID: [UUID: String] = [:]
+    private var activeTasksBySessionID: [UUID: Task<Void, Never>] = [:]
     private let responder: ChatResponding
 
     init(responder: ChatResponding = LocalFirstChatResponder()) {
@@ -94,6 +98,8 @@ final class IntelligenceService: ObservableObject {
             return
         }
 
+        cancelGeneration(in: session)
+
         generatingSessionIDs.insert(session.id)
         errorsBySessionID[session.id] = nil
 
@@ -105,36 +111,61 @@ final class IntelligenceService: ObservableObject {
 
         do {
             try modelContext.save()
-
-            let transcript = AIContextBuilder.transcript(for: session)
-            let stream = responder.streamResponse(
-                systemPromptSnapshot: session.systemPromptSnapshot,
-                transcript: transcript
-            )
-
-            for try await fragment in stream {
-                assistantMessage.text += fragment
-            }
-
-            if assistantMessage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                assistantMessage.text = "(No response generated.)"
-            }
-
-            try modelContext.save()
-            lastFailedPromptBySessionID[session.id] = nil
         } catch {
-            session.messages.removeAll { $0.id == assistantMessage.id }
-            errorsBySessionID[session.id] = error.localizedDescription
-            lastFailedPromptBySessionID[session.id] = prompt
+            errorsBySessionID[session.id] = "Failed to save chat state: \(error.localizedDescription)"
+            generatingSessionIDs.remove(session.id)
+            return
+        }
+
+        let transcript = AIContextBuilder.transcript(for: session)
+        let stream = responder.streamResponse(
+            systemPromptSnapshot: session.systemPromptSnapshot,
+            transcript: transcript
+        )
+
+        let sessionID = session.id
+        let task = Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            defer {
+                self.generatingSessionIDs.remove(sessionID)
+                self.activeTasksBySessionID[sessionID] = nil
+            }
 
             do {
+                for try await fragment in stream {
+                    try Task.checkCancellation()
+                    assistantMessage.text += fragment
+                }
+
+                if assistantMessage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    assistantMessage.text = "(No response generated.)"
+                }
+
                 try modelContext.save()
+                self.lastFailedPromptBySessionID[sessionID] = nil
+            } catch is CancellationError {
+                session.messages.removeAll { $0.id == assistantMessage.id }
+                self.errorsBySessionID[sessionID] = IntelligenceError.generationCancelled.localizedDescription
+                self.lastFailedPromptBySessionID[sessionID] = prompt
+                try? modelContext.save()
             } catch {
-                errorsBySessionID[session.id] = "Failed to save chat state: \(error.localizedDescription)"
+                session.messages.removeAll { $0.id == assistantMessage.id }
+                self.errorsBySessionID[sessionID] = self.friendlyErrorText(from: error)
+                self.lastFailedPromptBySessionID[sessionID] = prompt
+
+                do {
+                    try modelContext.save()
+                } catch {
+                    self.errorsBySessionID[sessionID] = "Failed to save chat state: \(error.localizedDescription)"
+                }
             }
         }
 
-        generatingSessionIDs.remove(session.id)
+        activeTasksBySessionID[sessionID] = task
+        await task.value
     }
 
     func retry(in session: ChatSession, modelContext: ModelContext) async {
@@ -142,5 +173,16 @@ final class IntelligenceService: ObservableObject {
             return
         }
         await send(prompt, in: session, modelContext: modelContext)
+    }
+
+    func cancelGeneration(in session: ChatSession) {
+        activeTasksBySessionID[session.id]?.cancel()
+    }
+
+    private func friendlyErrorText(from error: Error) -> String {
+        if let intelligenceError = error as? IntelligenceError {
+            return intelligenceError.localizedDescription
+        }
+        return error.localizedDescription
     }
 }
