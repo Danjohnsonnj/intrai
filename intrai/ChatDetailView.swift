@@ -5,6 +5,7 @@
 
 import SwiftUI
 import SwiftData
+import MarkdownUI
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -278,10 +279,6 @@ private struct SessionSnapshotView: View {
 private struct ChatMessageBubble: View {
     let message: ChatMessage
 
-    private var markdownText: AttributedString {
-        (try? AttributedString(markdown: message.text)) ?? AttributedString(message.text)
-    }
-
     var body: some View {
         let isUser = message.validatedRole == .user
 
@@ -295,8 +292,26 @@ private struct ChatMessageBubble: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
-                Text(markdownText)
-                    .textSelection(.enabled)
+                if isUser {
+                    Text(message.text)
+                        .textSelection(.enabled)
+                } else {
+                    Markdown(message.text)
+                        .markdownTheme(
+                            .gitHub
+                                .text {
+                                    ForegroundColor(.primary)
+                                    BackgroundColor(nil)
+                                }
+                                .code {
+                                    FontFamilyVariant(.monospaced)
+                                    FontSize(.em(0.85))
+                                    ForegroundColor(.primary)
+                                    BackgroundColor(.secondary.opacity(0.15))
+                                }
+                        )
+                        .textSelection(.enabled)
+                }
 
                 Text(message.timestamp, format: .dateTime.hour().minute())
                     .font(.caption2)
