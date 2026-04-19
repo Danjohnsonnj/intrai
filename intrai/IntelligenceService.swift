@@ -84,8 +84,12 @@ final class IntelligenceService: ObservableObject {
     private var generationStampsBySessionID: [UUID: UUID] = [:]
     private let responder: ChatResponding
 
-    init(responder: ChatResponding = LocalFirstChatResponder()) {
+    init(responder: ChatResponding) {
         self.responder = responder
+    }
+
+    init() {
+        self.responder = LocalFirstChatResponder()
     }
 
     func isGenerating(for session: ChatSession) -> Bool {
