@@ -77,6 +77,7 @@ final class IntelligenceService: ObservableObject {
 
     private var lastFailedPromptBySessionID: [UUID: String] = [:]
     private var activeTasksBySessionID: [UUID: Task<Void, Never>] = [:]
+    private var pendingCancellationSessionIDs: Set<UUID> = []
     private let responder: ChatResponding
 
     init(responder: ChatResponding = LocalFirstChatResponder()) {
@@ -98,7 +99,8 @@ final class IntelligenceService: ObservableObject {
             return
         }
 
-        cancelGeneration(in: session)
+        cancelActiveGenerationIfAny(in: session)
+        pendingCancellationSessionIDs.remove(session.id)
 
         generatingSessionIDs.insert(session.id)
         errorsBySessionID[session.id] = nil
@@ -131,20 +133,29 @@ final class IntelligenceService: ObservableObject {
             defer {
                 self.generatingSessionIDs.remove(sessionID)
                 self.activeTasksBySessionID[sessionID] = nil
+                self.pendingCancellationSessionIDs.remove(sessionID)
             }
 
             do {
                 for try await fragment in stream {
+                    if self.pendingCancellationSessionIDs.contains(sessionID) {
+                        throw CancellationError()
+                    }
+
                     try Task.checkCancellation()
 
                     if assistantMessage == nil,
-                       !fragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                       self.isDisplayableFragment(fragment) {
                         let message = ChatMessage(text: "", role: .assistant)
                         session.messages.append(message)
                         assistantMessage = message
                     }
 
                     assistantMessage?.text += fragment
+                }
+
+                if self.pendingCancellationSessionIDs.contains(sessionID) || Task.isCancelled {
+                    throw CancellationError()
                 }
 
                 if assistantMessage == nil {
@@ -180,6 +191,9 @@ final class IntelligenceService: ObservableObject {
         }
 
         activeTasksBySessionID[sessionID] = task
+        if pendingCancellationSessionIDs.remove(sessionID) != nil {
+            task.cancel()
+        }
         await task.value
     }
 
@@ -191,7 +205,24 @@ final class IntelligenceService: ObservableObject {
     }
 
     func cancelGeneration(in session: ChatSession) {
+        pendingCancellationSessionIDs.insert(session.id)
+
+        if let task = activeTasksBySessionID[session.id] {
+            task.cancel()
+            return
+        }
+
+        if generatingSessionIDs.contains(session.id) {
+            pendingCancellationSessionIDs.insert(session.id)
+        }
+    }
+
+    private func cancelActiveGenerationIfAny(in session: ChatSession) {
         activeTasksBySessionID[session.id]?.cancel()
+    }
+
+    private func isDisplayableFragment(_ fragment: String) -> Bool {
+        !fragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func friendlyErrorText(from error: Error) -> String {

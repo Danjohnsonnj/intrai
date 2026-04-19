@@ -55,9 +55,6 @@ struct ContentView: View {
                 }
             }
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
                         showingMemorySettings = true

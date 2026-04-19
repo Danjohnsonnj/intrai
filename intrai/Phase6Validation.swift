@@ -9,6 +9,7 @@ import SwiftData
 private enum Phase6ValidationError: LocalizedError {
     case generationStillRunningAfterCancellation
     case unexpectedCancellationMessage(String?)
+    case assistantMessageCreatedBeforeFirstToken(Int)
     case orphanedAssistantPlaceholder
     case generationStillRunningAfterFailure
     case unexpectedFailureMessage(String?)
@@ -19,6 +20,8 @@ private enum Phase6ValidationError: LocalizedError {
             return "Generation should end after cancellation"
         case let .unexpectedCancellationMessage(message):
             return "Expected cancellation message, got: \(message ?? "nil")"
+        case let .assistantMessageCreatedBeforeFirstToken(count):
+            return "Expected no assistant messages after early cancellation, found: \(count)"
         case .orphanedAssistantPlaceholder:
             return "Empty assistant placeholder should be removed on cancellation"
         case .generationStillRunningAfterFailure:
@@ -29,7 +32,7 @@ private enum Phase6ValidationError: LocalizedError {
     }
 }
 
-private struct DelayedMockResponder: ChatResponding {
+private struct EarlyTokenMockResponder: ChatResponding {
     func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -38,6 +41,22 @@ private struct DelayedMockResponder: ChatResponding {
                     continuation.yield("chunk1 ")
                     try await Task.sleep(nanoseconds: 120_000_000)
                     continuation.yield("chunk2")
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+}
+
+private struct SlowFirstTokenResponder: ChatResponding {
+    func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                    continuation.yield("first token")
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
@@ -66,10 +85,29 @@ enum Phase6Validation {
         )
         let context = ModelContext(container)
 
+        let earlyCancelSession = ChatSession(title: "Early Cancel", systemPromptSnapshot: "snapshot")
+        context.insert(earlyCancelSession)
+
+        let earlyCancelService = IntelligenceService(responder: SlowFirstTokenResponder())
+        let earlyCancelSendTask = Task {
+            await earlyCancelService.send("Cancel before first token", in: earlyCancelSession, modelContext: context)
+        }
+
+        for _ in 0..<20 where !earlyCancelService.isGenerating(for: earlyCancelSession) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        earlyCancelService.cancelGeneration(in: earlyCancelSession)
+        await earlyCancelSendTask.value
+
+        let earlyCancelAssistantCount = earlyCancelSession.messages.filter { $0.role == "assistant" }.count
+        if earlyCancelAssistantCount != 0 {
+            throw Phase6ValidationError.assistantMessageCreatedBeforeFirstToken(earlyCancelAssistantCount)
+        }
+
         let cancellationSession = ChatSession(title: "Cancellation", systemPromptSnapshot: "snapshot")
         context.insert(cancellationSession)
 
-        let cancellableService = IntelligenceService(responder: DelayedMockResponder())
+        let cancellableService = IntelligenceService(responder: EarlyTokenMockResponder())
         let sendTask = Task {
             await cancellableService.send("Please respond", in: cancellationSession, modelContext: context)
         }
