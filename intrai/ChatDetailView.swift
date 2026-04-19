@@ -181,8 +181,17 @@ struct ChatDetailView: View {
     }
 
     private func sendCurrentDraft() {
-        let prompt = draftMessage
+        let prompt = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+
+        // Resign focus first to end any active dictation session, then clear.
+        // The deferred clear handles the race where dictation writes a final
+        // transcription commit to the binding after the synchronous clear.
+        isInputFocused = false
         draftMessage = ""
+        DispatchQueue.main.async {
+            self.draftMessage = ""
+        }
 
         intelligenceService.cancelGeneration(in: session)
         Task {
