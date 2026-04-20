@@ -15,6 +15,7 @@ enum IntelligenceError: LocalizedError {
     case emptyPrompt
     case unavailableModel(String)
     case generationCancelled
+    case generationTimeout
 
     var errorDescription: String? {
         switch self {
@@ -24,6 +25,8 @@ enum IntelligenceError: LocalizedError {
             return reason
         case .generationCancelled:
             return "Generation cancelled."
+        case .generationTimeout:
+            return "Response timed out. Tap retry to try again."
         }
     }
 }
@@ -36,7 +39,10 @@ struct LocalFirstChatResponder: ChatResponding {
     func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
 #if canImport(FoundationModels)
         AsyncThrowingStream { continuation in
-            let innerTask = Task {
+            // PHASE 2 FIX: Task.detached so LanguageModelSession.respond() does NOT inherit
+            // main-actor execution context and cannot block the UI thread during cold-start
+            // or post-background-resume model loading.
+            let innerTask = Task.detached {
                 do {
                     let model = SystemLanguageModel.default
                     switch model.availability {
@@ -82,6 +88,12 @@ final class IntelligenceService: ObservableObject {
     private var activeTasksBySessionID: [UUID: Task<Void, Never>] = [:]
     private var pendingCancellationSessionIDs: Set<UUID> = []
     private var generationStampsBySessionID: [UUID: UUID] = [:]
+    // PHASE 3: Stamps for which the 15-second watchdog fired before the first fragment arrived.
+    // Used in the catch block to surface a timeout error instead of a generic cancel message.
+    private var timedOutStamps: Set<UUID> = []
+    // PHASE 3: Stamps for which at least one fragment has been received.
+    // The watchdog checks this to avoid timing out a generation that is already streaming.
+    private var firstFragmentReceivedStamps: Set<UUID> = []
     private let responder: ChatResponding
 
     init(responder: ChatResponding) {
@@ -149,10 +161,15 @@ final class IntelligenceService: ObservableObject {
                     self.generationStampsBySessionID.removeValue(forKey: sessionID)
                 }
                 self.pendingCancellationSessionIDs.remove(sessionID)
+                self.firstFragmentReceivedStamps.remove(stamp)
             }
 
             do {
                 for try await fragment in stream {
+                    if self.firstFragmentReceivedStamps.insert(stamp).inserted {
+                        // Mark that a fragment arrived so the watchdog will not fire.
+                    }
+
                     if self.pendingCancellationSessionIDs.contains(sessionID) {
                         throw CancellationError()
                     }
@@ -188,7 +205,12 @@ final class IntelligenceService: ObservableObject {
                 if let assistantMessage {
                     session.messages.removeAll { $0.id == assistantMessage.id }
                 }
-                self.errorsBySessionID[sessionID] = IntelligenceError.generationCancelled.localizedDescription
+                // PHASE 3: Distinguish watchdog timeout from user-initiated cancel.
+                if self.timedOutStamps.remove(stamp) != nil {
+                    self.errorsBySessionID[sessionID] = IntelligenceError.generationTimeout.localizedDescription
+                } else {
+                    self.errorsBySessionID[sessionID] = IntelligenceError.generationCancelled.localizedDescription
+                }
                 self.lastFailedPromptBySessionID[sessionID] = prompt
                 try? modelContext.save()
             } catch {
@@ -204,6 +226,18 @@ final class IntelligenceService: ObservableObject {
                     self.errorsBySessionID[sessionID] = "Failed to save chat state: \(error.localizedDescription)"
                 }
             }
+        }
+
+        // PHASE 3: Watchdog — fires after 15 seconds if no fragment has arrived yet.
+        // The stamp guard and firstFragmentReceivedStamps check ensure this is a no-op
+        // for any generation that already completed or received at least one fragment.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(15))
+            guard let self else { return }
+            guard self.generationStampsBySessionID[sessionID] == stamp else { return }
+            guard !self.firstFragmentReceivedStamps.contains(stamp) else { return }
+            self.timedOutStamps.insert(stamp)
+            self.activeTasksBySessionID[sessionID]?.cancel()
         }
 
         activeTasksBySessionID[sessionID] = task
