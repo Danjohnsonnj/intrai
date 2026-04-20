@@ -12,6 +12,7 @@ import UIKit
 
 struct ChatDetailView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.colorScheme) private var colorScheme
 
     let session: ChatSession
     @ObservedObject var intelligenceService: IntelligenceService
@@ -24,11 +25,23 @@ struct ChatDetailView: View {
     @State private var wasInputFocused = false
 
     private var orderedMessages: [ChatMessage] {
-        session.messages.sorted { $0.timestamp < $1.timestamp }
+        session.orderedMessages
     }
 
     private var isGenerating: Bool {
         intelligenceService.isGenerating(for: session)
+    }
+
+    private var contextProgress: Double {
+        intelligenceService.contextProgress(for: session)
+    }
+
+    private var progressBarColor: Color {
+        colorScheme == .dark ? .white.opacity(0.14) : .black.opacity(0.08)
+    }
+
+    private var progressTrackColor: Color {
+        colorScheme == .dark ? .white.opacity(0.14) : .black.opacity(0.08)
     }
 
     var body: some View {
@@ -87,6 +100,15 @@ struct ChatDetailView: View {
             }
 
             Divider()
+
+            ContextProgressBar(
+                progress: contextProgress,
+                barColor: progressBarColor,
+                trackColor: progressTrackColor
+            )
+            .padding(.horizontal, 150)
+            .padding(.top, 12)
+            .padding(.bottom, 2)
 
             if let errorText = intelligenceService.errorMessage(for: session) {
                 HStack {
@@ -177,6 +199,9 @@ struct ChatDetailView: View {
                 isInputFocused = true
             }
         }
+        .onAppear {
+            intelligenceService.evaluateContextProgress(for: session)
+        }
         .onDisappear {
             cancelCurrentGeneration()
         }
@@ -211,6 +236,36 @@ struct ChatDetailView: View {
 
     private func copyMessageAsMarkdown(_ message: ChatMessage) {
         UIPasteboard.general.string = ChatExport.markdown(for: message)
+    }
+}
+
+private struct ContextProgressBar: View {
+    let progress: Double
+    let barColor: Color
+    let trackColor: Color
+
+    private var clampedProgress: Double {
+        min(max(progress, 0), 1)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(trackColor)
+
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(barColor)
+                    .frame(width: geometry.size.width * clampedProgress)
+
+                RoundedRectangle(cornerRadius: 2)
+                    .stroke(barColor, lineWidth: 0.8)
+            }
+        }
+        .frame(height: 4)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Context usage")
+        .accessibilityValue("\(Int(clampedProgress * 100)) percent")
     }
 }
 

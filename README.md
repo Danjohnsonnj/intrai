@@ -12,6 +12,7 @@ All conversations stay on-device via SwiftData. The app uses Apple's `Foundation
 - **Streaming AI responses** — Responses stream token-by-token from `SystemLanguageModel.default` with cancellation support.
 - **Markdown rendering** — Assistant responses render full block Markdown (headings, code blocks, lists, bold/italic) via [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui). User messages are plain text.
 - **Markdown export** — Copy any conversation as plain-text Markdown from the chat menu, or long-press any message bubble to copy just that message as Markdown.
+- **Context usage progress bar** — A thin, always-visible bar above the composer estimates transcript context load. It fills left-to-right as conversations grow and uses monochrome styling by appearance mode (black in light mode, white in dark mode).
 - **Siri integration** — Say "Hey Siri, ask Intrai" to trigger a new chat via App Intents. Also runnable from the Shortcuts app.
 - **Secure deletion** — Swipe-to-delete a session and all associated messages are cascade-deleted.
 - **Error handling & retry** — Friendly error messages for model unavailability, generation failures, and cancellation. Failed prompts are stored for one-tap retry.
@@ -34,11 +35,11 @@ intrai/
 ├── UserMemory.swift           # @Model — singleton global memory
 ├── SnapshotBuilder.swift      # Composes system prompt + memory facts into snapshot
 ├── AIContextBuilder.swift     # Builds ordered transcript from session messages
-├── IntelligenceService.swift  # Generation lifecycle, cancellation, retry, auto-naming
+├── IntelligenceService.swift  # Generation lifecycle, cancellation, retry, auto-naming, context progress state
 ├── PendingIntentStore.swift   # @Observable singleton — bridges App Intent → ContentView
 ├── SiriIntents.swift          # AskIntraiIntent + IntraiShortcuts (AppShortcutsProvider)
 ├── ContentView.swift          # Session list sidebar, Memory Settings, intent handler
-├── ChatDetailView.swift       # Message timeline, composer, long-press rename, bubble copy menu, export menu
+├── ChatDetailView.swift       # Message timeline, composer, context progress bar, long-press rename, bubble copy menu, export menu
 └── ChatExport.swift           # Session and per-message markdown serialization
 ```
 

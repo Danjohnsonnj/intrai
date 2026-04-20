@@ -48,6 +48,15 @@ All six MVP phases are complete and committed. Post-MVP improvements have also b
 - Generation can be cancelled mid-stream from the Cancel button or by navigating away.
 - Graceful fallback via `#if canImport(FoundationModels)` for simulator builds.
 
+### Context Usage Progress Bar
+- `ChatDetailView` shows a thin, always-visible context progress bar above the composer.
+- `IntelligenceService.evaluateContextProgress(for:)` computes per-session fill ratio from transcript length using `AIContextBuilder`.
+- The bar fills left-to-right as estimated context load increases and clamps at 100%.
+- Styling is appearance-driven and monochrome for low visual noise:
+     - Light mode: black fill and black outline.
+     - Dark mode: white fill and white outline.
+- Progress is evaluated when a chat opens and before each send, so existing sessions and new activity both update the indicator.
+
 ### Memory Snapshot System
 - A global **System Prompt** and **User Memory facts** are edited in Memory Settings.
 - `SnapshotBuilder` composes them into a single snapshot string at session creation.
@@ -98,11 +107,11 @@ One external dependency: [swift-markdown-ui](https://github.com/gonzalezreal/swi
 | `UserMemory.swift` | `@Model` — singleton global memory; `fetch(from:)` load-or-create pattern |
 | `SnapshotBuilder.swift` | Pure function — composes system prompt + memory facts into a snapshot string |
 | `AIContextBuilder.swift` | Pure function — builds an ordered role-prefixed transcript from session messages |
-| `IntelligenceService.swift` | `@MainActor ObservableObject` — generation lifecycle, task tracking, cancellation, retry, auto-naming |
+| `IntelligenceService.swift` | `@MainActor ObservableObject` — generation lifecycle, task tracking, cancellation, retry, auto-naming, context progress state |
 | `PendingIntentStore.swift` | `@Observable` singleton — holds incoming Siri/App Intent question; observed by `ContentView` |
 | `SiriIntents.swift` | `AskIntraiIntent` + `IntraiShortcuts` (`AppShortcutsProvider`) |
 | `ContentView.swift` | Session list sidebar, `MemorySettingsView`, App Intent handler |
-| `ChatDetailView.swift` | Message timeline, composer, long-press rename, bubble context menu (copy markdown), action menu (snapshot/full copy) |
+| `ChatDetailView.swift` | Message timeline, composer, context progress bar, long-press rename, bubble context menu (copy markdown), action menu (snapshot/full copy) |
 | `ChatExport.swift` | Session and per-message markdown serialization |
 
 ### Data Models
@@ -145,6 +154,7 @@ generatingSessionIDs:       Set<UUID>           — which sessions have active g
 errorsBySessionID:          [UUID: String]       — last error per session
 lastFailedPromptBySessionID:[UUID: String]       — enables retry
 activeTasksBySessionID:     [UUID: Task<Void, Never>] — cancellation handles
+contextProgressBySessionID: [UUID: Double]       — per-session context fill ratio for the UI progress bar
 ```
 
 The `ChatResponding` protocol abstracts the AI provider:

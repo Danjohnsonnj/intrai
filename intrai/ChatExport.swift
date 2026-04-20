@@ -8,7 +8,7 @@ import Foundation
 struct ChatExport {
     static func markdown(for session: ChatSession) -> String {
         let createdText = session.createdAt.formatted(date: .abbreviated, time: .shortened)
-        let orderedMessages = session.messages.sorted { $0.timestamp < $1.timestamp }
+        let orderedMessages = session.orderedMessages
 
         var lines: [String] = []
         lines.append("# \(session.title)")

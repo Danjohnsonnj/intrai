@@ -41,4 +41,8 @@ final class ChatSession {
         lastSnapshotRefreshAt = Date()
         snapshotRefreshReason = trimmedReason
     }
+
+    var orderedMessages: [ChatMessage] {
+        messages.sorted { $0.timestamp < $1.timestamp }
+    }
 }

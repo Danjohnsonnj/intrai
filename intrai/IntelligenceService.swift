@@ -83,6 +83,7 @@ struct LocalFirstChatResponder: ChatResponding {
 final class IntelligenceService: ObservableObject {
     @Published private(set) var generatingSessionIDs: Set<UUID> = []
     @Published private(set) var errorsBySessionID: [UUID: String] = [:]
+    @Published private(set) var contextProgressBySessionID: [UUID: Double] = [:]
 
     private var lastFailedPromptBySessionID: [UUID: String] = [:]
     private var activeTasksBySessionID: [UUID: Task<Void, Never>] = [:]
@@ -112,6 +113,17 @@ final class IntelligenceService: ObservableObject {
         errorsBySessionID[session.id]
     }
 
+    func contextProgress(for session: ChatSession) -> Double {
+        contextProgressBySessionID[session.id] ?? 0
+    }
+
+    /// Evaluates the current transcript and updates the per-session context
+    /// progress ratio. Safe to call at any time on the main actor.
+    func evaluateContextProgress(for session: ChatSession) {
+        let transcript = AIContextBuilder.transcript(for: session)
+        contextProgressBySessionID[session.id] = AIContextBuilder.contextFillRatio(forTranscript: transcript)
+    }
+
     func send(_ rawPrompt: String, in session: ChatSession, modelContext: ModelContext) async {
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else {
@@ -137,6 +149,7 @@ final class IntelligenceService: ObservableObject {
         }
 
         let transcript = AIContextBuilder.transcript(for: session)
+        evaluateContextProgress(for: session)
         let stream = responder.streamResponse(
             systemPromptSnapshot: session.systemPromptSnapshot,
             transcript: transcript
@@ -183,7 +196,7 @@ final class IntelligenceService: ObservableObject {
                         assistantMessage = message
                     }
 
-                    assistantMessage?.text += fragment
+                    assistantMessage?.text.append(contentsOf: fragment)
                 }
 
                 if self.pendingCancellationSessionIDs.contains(sessionID) || Task.isCancelled {
@@ -289,9 +302,8 @@ final class IntelligenceService: ObservableObject {
             return
         }
 
-        let assistantText = session.messages
+        let assistantText = session.orderedMessages
             .filter { $0.validatedRole == .assistant }
-            .sorted { $0.timestamp < $1.timestamp }
             .first?.text ?? ""
 
         let systemInstruction = "Generate a title for this conversation in fewer than 6 words. Respond with the title only, no quotes or punctuation."
