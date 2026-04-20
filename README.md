@@ -11,7 +11,7 @@ All conversations stay on-device via SwiftData. The app uses Apple's `Foundation
 - **Memory snapshot system** — A global system prompt and user memory are composed into a snapshot and frozen into each session at creation time. Snapshots can be refreshed per-session with a confirmation dialog.
 - **Streaming AI responses** — Responses stream token-by-token from `SystemLanguageModel.default` with cancellation support.
 - **Markdown rendering** — Assistant responses render full block Markdown (headings, code blocks, lists, bold/italic) via [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui). User messages are plain text.
-- **Markdown export** — Copy any conversation as plain-text Markdown to the clipboard in one tap.
+- **Markdown export** — Copy any conversation as plain-text Markdown from the chat menu, or long-press any message bubble to copy just that message as Markdown.
 - **Siri integration** — Say "Hey Siri, ask Intrai" to trigger a new chat via App Intents. Also runnable from the Shortcuts app.
 - **Secure deletion** — Swipe-to-delete a session and all associated messages are cascade-deleted.
 - **Error handling & retry** — Friendly error messages for model unavailability, generation failures, and cancellation. Failed prompts are stored for one-tap retry.
@@ -38,8 +38,8 @@ intrai/
 ├── PendingIntentStore.swift   # @Observable singleton — bridges App Intent → ContentView
 ├── SiriIntents.swift          # AskIntraiIntent + IntraiShortcuts (AppShortcutsProvider)
 ├── ContentView.swift          # Session list sidebar, Memory Settings, intent handler
-├── ChatDetailView.swift       # Message timeline, composer, long-press rename, export menu
-└── ChatExport.swift           # Markdown serialization
+├── ChatDetailView.swift       # Message timeline, composer, long-press rename, bubble copy menu, export menu
+└── ChatExport.swift           # Session and per-message markdown serialization
 ```
 
 ### Key Design Decisions

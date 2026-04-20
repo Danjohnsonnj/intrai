@@ -37,7 +37,9 @@ struct ChatDetailView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(orderedMessages, id: \.id) { message in
-                            ChatMessageBubble(message: message)
+                            ChatMessageBubble(message: message) {
+                                copyMessageAsMarkdown(message)
+                            }
                                 .id(message.id)
                         }
 
@@ -206,6 +208,10 @@ struct ChatDetailView: View {
     private func exportMarkdown() {
         UIPasteboard.general.string = ChatExport.markdown(for: session)
     }
+
+    private func copyMessageAsMarkdown(_ message: ChatMessage) {
+        UIPasteboard.general.string = ChatExport.markdown(for: message)
+    }
 }
 
 private struct SessionSnapshotView: View {
@@ -287,6 +293,7 @@ private struct SessionSnapshotView: View {
 
 private struct ChatMessageBubble: View {
     let message: ChatMessage
+    let onCopyAsMarkdown: () -> Void
 
     var body: some View {
         let isUser = message.validatedRole == .user
@@ -303,7 +310,6 @@ private struct ChatMessageBubble: View {
 
                 if isUser {
                     Text(message.text)
-                        .textSelection(.enabled)
                 } else {
                     Markdown(message.text)
                         .markdownTheme(
@@ -319,7 +325,6 @@ private struct ChatMessageBubble: View {
                                     BackgroundColor(.secondary.opacity(0.15))
                                 }
                         )
-                        .textSelection(.enabled)
                 }
 
                 Text(message.timestamp, format: .dateTime.hour().minute())
@@ -329,6 +334,13 @@ private struct ChatMessageBubble: View {
             .padding(10)
             .background(isUser ? Color.accentColor.opacity(0.18) : Color.gray.opacity(0.14))
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .contextMenu {
+                Button {
+                    onCopyAsMarkdown()
+                } label: {
+                    Label("Copy as Markdown", systemImage: "doc.on.clipboard")
+                }
+            }
 
             if !isUser {
                 Spacer(minLength: 20)

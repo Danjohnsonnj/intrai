@@ -59,11 +59,13 @@ All six MVP phases are complete and committed. Post-MVP improvements have also b
 - Assistant message bubbles render full block Markdown via [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) 2.4.1 (`MarkdownUI` product, SPM).
 - Theme: `.gitHub` with `.primary` foreground and neutral code-block background for readability on coloured bubbles in light and dark mode.
 - User messages remain plain `Text` (user input is never Markdown).
-- Text is selectable in both branches.
+- Normal text selection is intentionally disabled on bubbles so long-press consistently opens the copy menu.
 
 ### Markdown Export
 - `ChatExport.markdown(for:)` serializes a session to a structured Markdown string (title, date, messages with role headings).
 - Tapping "Copy as Markdown" in the chat action menu writes the string to `UIPasteboard.general.string`. No file is created; no Share Sheet is shown.
+- Long-pressing a user or assistant message bubble opens a native context menu with "Copy as Markdown" to copy only that message.
+- Per-message copy uses `ChatExport.markdown(for: message)` and writes to `UIPasteboard.general.string`.
 
 ### Siri / App Intents
 - `AskIntraiIntent` (`AppIntent`) is registered with `openAppWhenRun = true`.
@@ -100,8 +102,8 @@ One external dependency: [swift-markdown-ui](https://github.com/gonzalezreal/swi
 | `PendingIntentStore.swift` | `@Observable` singleton — holds incoming Siri/App Intent question; observed by `ContentView` |
 | `SiriIntents.swift` | `AskIntraiIntent` + `IntraiShortcuts` (`AppShortcutsProvider`) |
 | `ContentView.swift` | Session list sidebar, `MemorySettingsView`, App Intent handler |
-| `ChatDetailView.swift` | Message timeline, composer, long-press rename, action menu (copy markdown, snapshot) |
-| `ChatExport.swift` | Markdown serialization |
+| `ChatDetailView.swift` | Message timeline, composer, long-press rename, bubble context menu (copy markdown), action menu (snapshot/full copy) |
+| `ChatExport.swift` | Session and per-message markdown serialization |
 
 ### Data Models
 

@@ -31,4 +31,13 @@ struct ChatExport {
 
         return lines.joined(separator: "\n")
     }
+
+    static func markdown(for message: ChatMessage) -> String {
+        switch message.validatedRole {
+        case .user:
+            return message.text
+        case .assistant:
+            return message.text
+        }
+    }
 }
