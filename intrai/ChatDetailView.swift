@@ -23,10 +23,17 @@ struct ChatDetailView: View {
     @State private var showingRenameAlert = false
     @State private var renameDraft = ""
     @State private var wasInputFocused = false
-
-    private var orderedMessages: [ChatMessage] {
-        session.orderedMessages
-    }
+    // Cached sort — re-evaluated only when the message count changes, not on every
+    // keystroke render. Eliminates the O(n log n) sort on each frame during typing.
+    // sortedMessages holds @Model reference-type objects: in-place mutations during
+    // streaming (e.g. assistantMessage.text updates) propagate via SwiftData's @Observable
+    // without requiring a count-triggered array refresh.
+    @State private var sortedMessages: [ChatMessage] = []
+    @State private var generationElapsedSeconds: Int = 0
+    @State private var generationStartedAt: Date? = nil
+    // Task-based timer: created when generation starts, cancelled when it ends.
+    // Avoids the one-second run-loop wake cost while the user is not generating.
+    @State private var elapsedTimerTask: Task<Void, Never>? = nil
 
     private var isGenerating: Bool {
         intelligenceService.isGenerating(for: session)
@@ -37,7 +44,9 @@ struct ChatDetailView: View {
     }
 
     private var progressBarColor: Color {
-        colorScheme == .dark ? .white.opacity(0.14) : .black.opacity(0.08)
+        if contextProgress >= 0.8 { return .red.opacity(0.8) }
+        if contextProgress >= 0.5 { return .orange.opacity(0.7) }
+        return colorScheme == .dark ? .white.opacity(0.3) : .green.opacity(0.6)
     }
 
     private var progressTrackColor: Color {
@@ -49,7 +58,7 @@ struct ChatDetailView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(orderedMessages, id: \.id) { message in
+                        ForEach(sortedMessages, id: \.id) { message in
                             ChatMessageBubble(message: message) {
                                 copyMessageAsMarkdown(message)
                             }
@@ -59,7 +68,9 @@ struct ChatDetailView: View {
                         if isGenerating {
                             HStack(spacing: 8) {
                                 ProgressView()
-                                Text("Generating response...")
+                                Text(generationElapsedSeconds < 10
+                                     ? "Generating... \(generationElapsedSeconds)s"
+                                     : "Apple Intelligence is taking a moment... \(generationElapsedSeconds)s")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
 
@@ -76,8 +87,8 @@ struct ChatDetailView: View {
                     }
                     .padding(12)
                 }
-                .onChange(of: orderedMessages.count) { _, _ in
-                    if let last = orderedMessages.last {
+                .onChange(of: sortedMessages.count) { _, _ in
+                    if let last = sortedMessages.last {
                         withAnimation {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
@@ -91,7 +102,7 @@ struct ChatDetailView: View {
                     }
                 }
                 .onChange(of: isInputFocused) { _, focused in
-                    if focused, let last = orderedMessages.last {
+                    if focused, let last = sortedMessages.last {
                         withAnimation {
                             proxy.scrollTo(last.id, anchor: .bottom)
                         }
@@ -108,11 +119,19 @@ struct ChatDetailView: View {
             )
             .padding(.horizontal, 150)
             .padding(.top, 12)
-            .padding(.bottom, 2)
+            .padding(.bottom, contextProgress >= 0.8 ? 0 : 2)
+
+            if contextProgress >= 0.8 {
+                Text("Context nearly full")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .padding(.bottom, 2)
+            }
 
             if let errorText = intelligenceService.errorMessage(for: session) {
+                let retryBlocked = intelligenceService.retryBlockedReason(for: session)
                 HStack {
-                    Text(errorText)
+                    Text(retryBlocked ?? errorText)
                         .font(.footnote)
                         .foregroundStyle(.red)
                         .lineLimit(2)
@@ -124,7 +143,7 @@ struct ChatDetailView: View {
                             await intelligenceService.retry(in: session, modelContext: modelContext)
                         }
                     }
-                    .disabled(isGenerating)
+                    .disabled(isGenerating || retryBlocked != nil)
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
@@ -200,9 +219,38 @@ struct ChatDetailView: View {
             }
         }
         .onAppear {
+            sortedMessages = session.orderedMessages
             intelligenceService.evaluateContextProgress(for: session)
         }
+        .onChange(of: session.messages.count) { _, _ in
+            sortedMessages = session.orderedMessages
+        }
+        .onChange(of: isGenerating) { _, generating in
+            if generating {
+                generationStartedAt = Date()
+                generationElapsedSeconds = 0
+                elapsedTimerTask?.cancel()
+                elapsedTimerTask = Task { @MainActor in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .seconds(1))
+                        guard let start = generationStartedAt else { break }
+                        generationElapsedSeconds = Int(Date().timeIntervalSince(start))
+                    }
+                }
+            } else {
+                generationStartedAt = nil
+                elapsedTimerTask?.cancel()
+                elapsedTimerTask = nil
+            }
+        }
+        .onChange(of: draftMessage) { _, newValue in
+            // Prewarm on first keystroke while not already generating.
+            if newValue.count == 1, !isGenerating {
+                intelligenceService.prewarm(for: session)
+            }
+        }
         .onDisappear {
+            elapsedTimerTask?.cancel()
             cancelCurrentGeneration()
         }
     }
@@ -231,6 +279,9 @@ struct ChatDetailView: View {
     }
 
     private func exportMarkdown() {
+        // ChatExport.markdown is pure string concatenation — no I/O.
+        // UIPasteboard must be written on the main thread; this call site is already
+        // main-actor-bound (invoked from a SwiftUI toolbar action).
         UIPasteboard.general.string = ChatExport.markdown(for: session)
     }
 

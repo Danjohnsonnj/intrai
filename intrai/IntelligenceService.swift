@@ -16,6 +16,8 @@ enum IntelligenceError: LocalizedError {
     case unavailableModel(String)
     case generationCancelled
     case generationTimeout
+    case generationStalled
+    case circuitOpen
 
     var errorDescription: String? {
         switch self {
@@ -27,6 +29,10 @@ enum IntelligenceError: LocalizedError {
             return "Generation cancelled."
         case .generationTimeout:
             return "Response timed out. Tap retry to try again."
+        case .generationStalled:
+            return "Response stalled. Tap retry to try again."
+        case .circuitOpen:
+            return "Model is unavailable. Please restart the app to try again."
         }
     }
 }
@@ -36,33 +42,32 @@ protocol ChatResponding {
 }
 
 struct LocalFirstChatResponder: ChatResponding {
+    // Uses session.streamResponse(to:) for true token-by-token streaming.
+    // Each element yielded is a cumulative snapshot of the response so far (not a delta).
+    // The startup watchdog in IntelligenceService is the primary safety net for hangs.
     func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
 #if canImport(FoundationModels)
         AsyncThrowingStream { continuation in
-            // PHASE 2 FIX: Task.detached so LanguageModelSession.respond() does NOT inherit
-            // main-actor execution context and cannot block the UI thread during cold-start
-            // or post-background-resume model loading.
-            let innerTask = Task.detached {
+            let innerTask = Task.detached(priority: .userInitiated) {
                 do {
                     let model = SystemLanguageModel.default
                     switch model.availability {
-                    case .available:
-                        let session = LanguageModelSession(instructions: systemPromptSnapshot)
-                        let response = try await session.respond(to: transcript)
-                        let fullText = response.content
-
-                        if fullText.isEmpty {
-                            continuation.finish()
-                            return
-                        }
-
-                        for token in fullText.split(separator: " ", omittingEmptySubsequences: false) {
-                            continuation.yield(String(token) + " ")
-                        }
-                        continuation.finish()
                     case .unavailable(let reason):
                         continuation.finish(throwing: IntelligenceError.unavailableModel("Apple Intelligence unavailable: \(reason)."))
+                        return
+                    case .available: break
                     }
+
+                    let session = LanguageModelSession(instructions: systemPromptSnapshot)
+                    let responseStream = session.streamResponse(to: transcript)
+                    for try await snapshot in responseStream {
+                        if Task.isCancelled {
+                            continuation.finish(throwing: CancellationError())
+                            return
+                        }
+                        continuation.yield(snapshot.content)
+                    }
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -95,6 +100,24 @@ final class IntelligenceService: ObservableObject {
     // PHASE 3: Stamps for which at least one fragment has been received.
     // The watchdog checks this to avoid timing out a generation that is already streaming.
     private var firstFragmentReceivedStamps: Set<UUID> = []
+    private var midStreamStalledStamps: Set<UUID> = []
+    private var midStreamWatchdogArmedStamps: Set<UUID> = []
+    private var sendStartedAtByStamp: [UUID: Date] = [:]
+    private var fragmentCountByStamp: [UUID: Int] = [:]
+    private var lastFragmentTimestampByStamp: [UUID: Date] = [:]
+    private var midStreamWatchdogTickCountByStamp: [UUID: Int] = [:]
+    // Actual adaptive watchdog duration used for each stamp — logged at check time.
+    private var watchdogSecondsByStamp: [UUID: Double] = [:]
+
+    // PHASE 1: Retry governance — timeout streak, cooldown, and circuit breaker.
+    // streak=1 → 5s floor + up-to-60s availability poll
+    // streak=2 → 10s floor + up-to-60s availability poll
+    // streak≥3 → circuit open (blocks retries for the app lifetime)
+    private var timeoutStreakBySessionID: [UUID: Int] = [:]
+    private var cooldownUntilBySessionID: [UUID: Date] = [:]
+    private var circuitOpenedAt: Date? = nil
+    @Published private(set) var retryBlockedBySessionID: [UUID: String] = [:]
+
     private let responder: ChatResponding
 
     init(responder: ChatResponding) {
@@ -117,47 +140,118 @@ final class IntelligenceService: ObservableObject {
         contextProgressBySessionID[session.id] ?? 0
     }
 
+    /// Returns a human-readable reason the Retry button should be suppressed,
+    /// or nil if retry is currently available.
+    func retryBlockedReason(for session: ChatSession) -> String? {
+        retryBlockedBySessionID[session.id]
+    }
+
     /// Evaluates the current transcript and updates the per-session context
     /// progress ratio. Safe to call at any time on the main actor.
     func evaluateContextProgress(for session: ChatSession) {
-        let transcript = AIContextBuilder.transcript(for: session)
+        let systemPromptBudget = AIContextBuilder.estimatedTokens(forTranscript: session.systemPromptSnapshot)
+        let transcript = AIContextBuilder.transcript(for: session, systemPromptBudget: systemPromptBudget)
         contextProgressBySessionID[session.id] = AIContextBuilder.contextFillRatio(forTranscript: transcript)
     }
 
     func send(_ rawPrompt: String, in session: ChatSession, modelContext: ModelContext) async {
+        // Yield to other pending tasks on the cooperative executor before starting heavy work.
+        // Does not flush the run loop or guarantee UI frame rendering.
+        await Task.yield()
+
         let prompt = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionID = session.id
+
         guard !prompt.isEmpty else {
-            errorsBySessionID[session.id] = IntelligenceError.emptyPrompt.localizedDescription
+            errorsBySessionID[sessionID] = IntelligenceError.emptyPrompt.localizedDescription
+            FreezeLogger.shared.log("send_rejected_empty_prompt", level: .warning, sessionID: sessionID)
             return
         }
 
         cancelActiveGenerationIfAny(in: session)
-        pendingCancellationSessionIDs.remove(session.id)
+        pendingCancellationSessionIDs.remove(sessionID)
 
-        generatingSessionIDs.insert(session.id)
-        errorsBySessionID[session.id] = nil
+        generatingSessionIDs.insert(sessionID)
+        errorsBySessionID[sessionID] = nil
+        // Clear any stale cooldown message — a fresh send supersedes previous retry governance.
+        retryBlockedBySessionID.removeValue(forKey: sessionID)
+
+        let stamp = UUID()
+        generationStampsBySessionID[sessionID] = stamp
+        sendStartedAtByStamp[stamp] = Date()
+        fragmentCountByStamp[stamp] = 0
+
+        FreezeLogger.shared.log(
+            "send_start",
+            sessionID: sessionID,
+            generationStamp: stamp,
+            metadata: [
+                "existingMessages": String(session.messages.count)
+            ]
+        )
 
         let userMessage = ChatMessage(text: prompt, role: .user)
         session.messages.append(userMessage)
 
+        let saveUserStartedAt = Date()
         do {
             try modelContext.save()
+            FreezeLogger.shared.log(
+                "save_user_message_end",
+                sessionID: sessionID,
+                generationStamp: stamp,
+                durationMs: Date().timeIntervalSince(saveUserStartedAt) * 1000
+            )
         } catch {
-            errorsBySessionID[session.id] = "Failed to save chat state: \(error.localizedDescription)"
-            generatingSessionIDs.remove(session.id)
+            errorsBySessionID[sessionID] = "Failed to save chat state: \(error.localizedDescription)"
+            generatingSessionIDs.remove(sessionID)
+            generationStampsBySessionID.removeValue(forKey: sessionID)
+            sendStartedAtByStamp.removeValue(forKey: stamp)
+            fragmentCountByStamp.removeValue(forKey: stamp)
+            FreezeLogger.shared.log(
+                "save_user_message_failed",
+                level: .error,
+                sessionID: sessionID,
+                generationStamp: stamp,
+                durationMs: Date().timeIntervalSince(saveUserStartedAt) * 1000,
+                metadata: ["error": String(describing: type(of: error))]
+            )
             return
         }
 
-        let transcript = AIContextBuilder.transcript(for: session)
-        evaluateContextProgress(for: session)
+        let transcriptStartedAt = Date()
+        FreezeLogger.shared.log("transcript_build_start", sessionID: sessionID, generationStamp: stamp)
+        let systemPromptBudget = AIContextBuilder.estimatedTokens(forTranscript: session.systemPromptSnapshot)
+        let transcript = AIContextBuilder.transcript(for: session, systemPromptBudget: systemPromptBudget)
+        FreezeLogger.shared.log(
+            "transcript_build_end",
+            sessionID: sessionID,
+            generationStamp: stamp,
+            durationMs: Date().timeIntervalSince(transcriptStartedAt) * 1000,
+            metadata: [
+                "chars": String(transcript.utf16.count),
+                "messages": String(session.messages.count)
+            ]
+        )
+
+        let contextEvalStartedAt = Date()
+        contextProgressBySessionID[session.id] = AIContextBuilder.contextFillRatio(forTranscript: transcript)
+        FreezeLogger.shared.log(
+            "context_progress_evaluated",
+            sessionID: sessionID,
+            generationStamp: stamp,
+            durationMs: Date().timeIntervalSince(contextEvalStartedAt) * 1000,
+            metadata: [
+                "fillRatio": String(format: "%.4f", contextProgress(for: session))
+            ]
+        )
+
         let stream = responder.streamResponse(
             systemPromptSnapshot: session.systemPromptSnapshot,
             transcript: transcript
         )
+        FreezeLogger.shared.log("stream_initialized", sessionID: sessionID, generationStamp: stamp)
 
-        let sessionID = session.id
-        let stamp = UUID()
-        generationStampsBySessionID[sessionID] = stamp
         let task = Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -175,12 +269,42 @@ final class IntelligenceService: ObservableObject {
                 }
                 self.pendingCancellationSessionIDs.remove(sessionID)
                 self.firstFragmentReceivedStamps.remove(stamp)
+                self.midStreamStalledStamps.remove(stamp)
+                self.midStreamWatchdogArmedStamps.remove(stamp)
+                self.sendStartedAtByStamp.removeValue(forKey: stamp)
+                self.fragmentCountByStamp.removeValue(forKey: stamp)
+                self.lastFragmentTimestampByStamp.removeValue(forKey: stamp)
+                self.midStreamWatchdogTickCountByStamp.removeValue(forKey: stamp)
+                self.watchdogSecondsByStamp.removeValue(forKey: stamp)
             }
 
             do {
                 for try await fragment in stream {
                     if self.firstFragmentReceivedStamps.insert(stamp).inserted {
-                        // Mark that a fragment arrived so the watchdog will not fire.
+                        let firstTokenLatencyMs = self.sendStartedAtByStamp[stamp].map {
+                            Date().timeIntervalSince($0) * 1000
+                        }
+                        FreezeLogger.shared.log(
+                            "first_fragment_received",
+                            sessionID: sessionID,
+                            generationStamp: stamp,
+                            durationMs: firstTokenLatencyMs
+                        )
+                        if let ms = firstTokenLatencyMs {
+                            self.recordFirstTokenLatency(ms)
+                        }
+                    }
+
+                    let updatedFragmentCount = (self.fragmentCountByStamp[stamp] ?? 0) + 1
+                    self.fragmentCountByStamp[stamp] = updatedFragmentCount
+                    self.lastFragmentTimestampByStamp[stamp] = Date()
+                    if updatedFragmentCount.isMultiple(of: 20) {
+                        FreezeLogger.shared.log(
+                            "fragment_sample",
+                            sessionID: sessionID,
+                            generationStamp: stamp,
+                            metadata: ["count": String(updatedFragmentCount)]
+                        )
                     }
 
                     if self.pendingCancellationSessionIDs.contains(sessionID) {
@@ -196,7 +320,8 @@ final class IntelligenceService: ObservableObject {
                         assistantMessage = message
                     }
 
-                    assistantMessage?.text.append(contentsOf: fragment)
+                    // Fragments are cumulative snapshots — replace, never append.
+                    assistantMessage?.text = fragment
                 }
 
                 if self.pendingCancellationSessionIDs.contains(sessionID) || Task.isCancelled {
@@ -211,8 +336,28 @@ final class IntelligenceService: ObservableObject {
                     assistantMessage?.text = "(No response generated.)"
                 }
 
+                FreezeLogger.shared.log(
+                    "stream_completed",
+                    sessionID: sessionID,
+                    generationStamp: stamp,
+                    durationMs: self.sendStartedAtByStamp[stamp].map { Date().timeIntervalSince($0) * 1000 },
+                    metadata: ["fragments": String(self.fragmentCountByStamp[stamp] ?? 0)]
+                )
+
+                let saveAssistantStartedAt = Date()
                 try modelContext.save()
+                FreezeLogger.shared.log(
+                    "save_assistant_message_end",
+                    sessionID: sessionID,
+                    generationStamp: stamp,
+                    durationMs: Date().timeIntervalSince(saveAssistantStartedAt) * 1000
+                )
                 self.lastFailedPromptBySessionID[sessionID] = nil
+                // Successful generation resets the timeout streak and any pending cooldown for
+                // this session so that a subsequent retry() is not silently blocked by a stale
+                // cooldown deadline that predates the successful response.
+                self.timeoutStreakBySessionID.removeValue(forKey: sessionID)
+                self.cooldownUntilBySessionID.removeValue(forKey: sessionID)
                 await self.autoNameIfNeeded(session: session, firstUserText: prompt, modelContext: modelContext)
             } catch is CancellationError {
                 if let assistantMessage {
@@ -221,8 +366,30 @@ final class IntelligenceService: ObservableObject {
                 // PHASE 3: Distinguish watchdog timeout from user-initiated cancel.
                 if self.timedOutStamps.remove(stamp) != nil {
                     self.errorsBySessionID[sessionID] = IntelligenceError.generationTimeout.localizedDescription
+                    FreezeLogger.shared.log(
+                        "generation_timeout",
+                        level: .warning,
+                        sessionID: sessionID,
+                        generationStamp: stamp
+                    )
+                    self.applyTimeoutGovernance(sessionID: sessionID, stamp: stamp)
+                } else if self.midStreamStalledStamps.remove(stamp) != nil {
+                    self.errorsBySessionID[sessionID] = IntelligenceError.generationStalled.localizedDescription
+                    FreezeLogger.shared.log(
+                        "generation_stalled",
+                        level: .warning,
+                        sessionID: sessionID,
+                        generationStamp: stamp,
+                        metadata: ["fragments": String(self.fragmentCountByStamp[stamp] ?? 0)]
+                    )
                 } else {
                     self.errorsBySessionID[sessionID] = IntelligenceError.generationCancelled.localizedDescription
+                    FreezeLogger.shared.log(
+                        "generation_cancelled",
+                        level: .warning,
+                        sessionID: sessionID,
+                        generationStamp: stamp
+                    )
                 }
                 self.lastFailedPromptBySessionID[sessionID] = prompt
                 try? modelContext.save()
@@ -232,25 +399,74 @@ final class IntelligenceService: ObservableObject {
                 }
                 self.errorsBySessionID[sessionID] = self.friendlyErrorText(from: error)
                 self.lastFailedPromptBySessionID[sessionID] = prompt
+                // Responder-level hard timeout surfaces here as IntelligenceError.generationTimeout.
+                if let ie = error as? IntelligenceError, case .generationTimeout = ie {
+                    FreezeLogger.shared.log(
+                        "generation_timeout",
+                        level: .warning,
+                        sessionID: sessionID,
+                        generationStamp: stamp
+                    )
+                    self.applyTimeoutGovernance(sessionID: sessionID, stamp: stamp)
+                } else {
+                    FreezeLogger.shared.log(
+                        "generation_failed",
+                        level: .error,
+                        sessionID: sessionID,
+                        generationStamp: stamp,
+                        metadata: ["error": String(describing: type(of: error))]
+                    )
+                }
 
                 do {
                     try modelContext.save()
                 } catch {
                     self.errorsBySessionID[sessionID] = "Failed to save chat state: \(error.localizedDescription)"
+                    FreezeLogger.shared.log(
+                        "save_after_failure_failed",
+                        level: .error,
+                        sessionID: sessionID,
+                        generationStamp: stamp,
+                        metadata: ["error": String(describing: type(of: error))]
+                    )
                 }
-            }
+            } // end catch error
         }
 
-        // PHASE 3: Watchdog — fires after 15 seconds if no fragment has arrived yet.
-        // The stamp guard and firstFragmentReceivedStamps check ensure this is a no-op
-        // for any generation that already completed or received at least one fragment.
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(15))
+        // PHASE 4: Startup watchdog — detached timer so sleep is independent of main-actor scheduling.
+        // After the sleep, checks and cancellation happen on MainActor to safely touch service state.
+        let watchdogSeconds = adaptiveStartupWatchdogSeconds()
+        watchdogSecondsByStamp[stamp] = watchdogSeconds
+        FreezeLogger.shared.log("startup_watchdog_armed", sessionID: sessionID, generationStamp: stamp)
+        Task.detached { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(watchdogSeconds))
+            } catch {
+                return
+            }
+
             guard let self else { return }
-            guard self.generationStampsBySessionID[sessionID] == stamp else { return }
-            guard !self.firstFragmentReceivedStamps.contains(stamp) else { return }
-            self.timedOutStamps.insert(stamp)
-            self.activeTasksBySessionID[sessionID]?.cancel()
+            await self.handleStartupWatchdogCheck(sessionID: sessionID, stamp: stamp)
+        }
+
+        // PHASE 4: Mid-stream watchdog — detached polling timer that checks for a long
+        // gap between fragments and cancels if no fragment arrives for 45 seconds.
+        FreezeLogger.shared.log("mid_stream_watchdog_spawned", sessionID: sessionID, generationStamp: stamp)
+        Task.detached { [weak self] in
+            while true {
+                do {
+                    try await Task.sleep(for: .seconds(10))
+                } catch {
+                    return
+                }
+
+                guard let self else { return }
+                let shouldContinue = await self.handleMidStreamWatchdogPoll(sessionID: sessionID, stamp: stamp)
+
+                if !shouldContinue {
+                    return
+                }
+            }
         }
 
         activeTasksBySessionID[sessionID] = task
@@ -260,9 +476,27 @@ final class IntelligenceService: ObservableObject {
     }
 
     func retry(in session: ChatSession, modelContext: ModelContext) async {
-        guard let prompt = lastFailedPromptBySessionID[session.id] else {
+        let sessionID = session.id
+        guard let prompt = lastFailedPromptBySessionID[sessionID] else { return }
+
+        // Circuit breaker: model has timed out too many times this launch — block retries.
+        if circuitOpenedAt != nil {
+            FreezeLogger.shared.log("retry_blocked_circuit_open", level: .warning, sessionID: sessionID)
             return
         }
+
+        // Cooldown: enforce a backoff delay between consecutive timeout retries.
+        if let cooldownUntil = cooldownUntilBySessionID[sessionID], Date() < cooldownUntil {
+            let remaining = Int(cooldownUntil.timeIntervalSinceNow.rounded(.up))
+            FreezeLogger.shared.log(
+                "retry_blocked_cooldown",
+                level: .warning,
+                sessionID: sessionID,
+                metadata: ["remainingSeconds": String(remaining)]
+            )
+            return
+        }
+
         await send(prompt, in: session, modelContext: modelContext)
     }
 
@@ -283,11 +517,146 @@ final class IntelligenceService: ObservableObject {
         activeTasksBySessionID[session.id]?.cancel()
     }
 
+    private func handleStartupWatchdogCheck(sessionID: UUID, stamp: UUID) {
+        guard generationStampsBySessionID[sessionID] == stamp else { return }
+
+        let actualDurationMs = watchdogSecondsByStamp[stamp].map { $0 * 1000 }
+        let firstFragmentSeen = firstFragmentReceivedStamps.contains(stamp)
+        FreezeLogger.shared.log(
+            "startup_watchdog_checked",
+            sessionID: sessionID,
+            generationStamp: stamp,
+            durationMs: actualDurationMs,
+            metadata: ["firstFragmentSeen": firstFragmentSeen ? "true" : "false"]
+        )
+
+        guard !firstFragmentSeen else { return }
+        timedOutStamps.insert(stamp)
+        FreezeLogger.shared.log(
+            "watchdog_timeout_fired",
+            level: .warning,
+            sessionID: sessionID,
+            generationStamp: stamp,
+            durationMs: actualDurationMs
+        )
+        activeTasksBySessionID[sessionID]?.cancel()
+    }
+
+    private func handleMidStreamWatchdogPoll(sessionID: UUID, stamp: UUID) -> Bool {
+        guard generationStampsBySessionID[sessionID] == stamp else { return false }
+
+        let updatedTickCount = (midStreamWatchdogTickCountByStamp[stamp] ?? 0) + 1
+        midStreamWatchdogTickCountByStamp[stamp] = updatedTickCount
+        if updatedTickCount.isMultiple(of: 3) {
+            FreezeLogger.shared.log(
+                "mid_stream_watchdog_tick",
+                sessionID: sessionID,
+                generationStamp: stamp
+            )
+        }
+
+        guard firstFragmentReceivedStamps.contains(stamp) else { return true }
+
+        if midStreamWatchdogArmedStamps.insert(stamp).inserted {
+            FreezeLogger.shared.log(
+                "mid_stream_watchdog_armed",
+                sessionID: sessionID,
+                generationStamp: stamp
+            )
+        }
+
+        guard let lastFragmentAt = lastFragmentTimestampByStamp[stamp] else { return true }
+        let elapsedMs = Date().timeIntervalSince(lastFragmentAt) * 1000
+        guard elapsedMs >= 45_000 else { return true }
+
+        midStreamStalledStamps.insert(stamp)
+        FreezeLogger.shared.log(
+            "mid_stream_stall_detected",
+            level: .warning,
+            sessionID: sessionID,
+            generationStamp: stamp,
+            durationMs: elapsedMs,
+            metadata: ["fragments": String(fragmentCountByStamp[stamp] ?? 0)]
+        )
+        activeTasksBySessionID[sessionID]?.cancel()
+        return false
+    }
+
+    /// Escalates the timeout streak for a session and applies a cooldown or opens the circuit breaker.
+    /// - streak 1 → 5s minimum floor + availability observation (60s cap)
+    /// - streak 2 → 10s minimum floor + availability observation (60s cap)
+    /// - streak ≥ 3 → circuit open (blocks retries for the app lifetime)
+    private func applyTimeoutGovernance(sessionID: UUID, stamp: UUID) {
+        let streak = (timeoutStreakBySessionID[sessionID] ?? 0) + 1
+        timeoutStreakBySessionID[sessionID] = streak
+
+        if streak >= 3 {
+            guard circuitOpenedAt == nil else { return }
+            circuitOpenedAt = Date()
+            let msg = IntelligenceError.circuitOpen.localizedDescription
+            retryBlockedBySessionID[sessionID] = msg
+            FreezeLogger.shared.log(
+                "model_circuit_opened",
+                level: .error,
+                sessionID: sessionID,
+                generationStamp: stamp,
+                metadata: ["streak": String(streak)]
+            )
+            return
+        }
+
+        // Minimum hold: 5s for streak 1, 10s for streak 2. After the floor,
+        // observe availability until .available or the 60s cap expires.
+        // cooldownUntil covers the full window (floor + cap) so retry()'s
+        // cooldownUntilBySessionID gate remains valid throughout the wait.
+        let minimumHoldSeconds: Double = streak == 1 ? 5 : 10
+        let cooldownUntil = Date().addingTimeInterval(minimumHoldSeconds + 60)
+        cooldownUntilBySessionID[sessionID] = cooldownUntil
+        retryBlockedBySessionID[sessionID] = "Checking if model is ready\u{2026}"
+        FreezeLogger.shared.log(
+            "retry_cooldown_started",
+            level: .warning,
+            sessionID: sessionID,
+            generationStamp: stamp,
+            metadata: ["minimumHoldSeconds": String(Int(minimumHoldSeconds)), "streak": String(streak)]
+        )
+        // Phase A: unconditional minimum hold.
+        // Phase B: observe availability; exit as soon as .available or 60s cap.
+        // The deadline-equality guard prevents a stale task from clearing a newer cooldown.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(minimumHoldSeconds))
+            guard let self else { return }
+            guard self.cooldownUntilBySessionID[sessionID] == cooldownUntil else { return }
+
+            let cap = Date().addingTimeInterval(60)
+            while Date() < cap {
+                if case .available = SystemLanguageModel.default.availability { break }
+                try? await Task.sleep(for: .seconds(2))
+            }
+
+            guard self.cooldownUntilBySessionID[sessionID] == cooldownUntil else { return }
+            self.retryBlockedBySessionID.removeValue(forKey: sessionID)
+            self.cooldownUntilBySessionID.removeValue(forKey: sessionID)
+            FreezeLogger.shared.log("retry_cooldown_ended", sessionID: sessionID)
+        }
+    }
+
     private func autoNameIfNeeded(session: ChatSession, firstUserText: String, modelContext: ModelContext) async {
         // Only rename sessions that still have the default title and have exactly
         // one user message + one assistant message (i.e. the very first exchange).
         guard session.title == "New Chat",
-              session.messages.count == 2 else { return }
+              session.messages.count == 2 else {
+            FreezeLogger.shared.log(
+                "autoname_skipped",
+                sessionID: session.id,
+                metadata: [
+                    "messages": String(session.messages.count)
+                ]
+            )
+            return
+        }
+
+        FreezeLogger.shared.log("autoname_started", sessionID: session.id)
 
         let fallback = "✦ " + firstUserText
             .split(separator: " ", maxSplits: 5, omittingEmptySubsequences: true)
@@ -299,31 +668,52 @@ final class IntelligenceService: ObservableObject {
         guard case .available = model.availability else {
             session.title = fallback
             try? modelContext.save()
+            FreezeLogger.shared.log("autoname_model_unavailable", level: .warning, sessionID: session.id)
             return
         }
 
         let assistantText = session.orderedMessages
             .filter { $0.validatedRole == .assistant }
             .first?.text ?? ""
+        let autonameSessionID = session.id
 
         let systemInstruction = "Generate a title for this conversation in fewer than 6 words. Respond with the title only, no quotes or punctuation."
         let namingPrompt = "User: \(firstUserText)\nAssistant: \(assistantText)"
 
         do {
-            let namingSession = LanguageModelSession(instructions: systemInstruction)
-            let response = try await namingSession.respond(to: namingPrompt)
-            let trimmed = response.content
+            let namingStartedAt = Date()
+            FreezeLogger.shared.log("autoname_model_call_started", sessionID: autonameSessionID)
+            FreezeLogger.shared.log("autoname_model_call_detached_started", sessionID: autonameSessionID)
+            let responseText = try await Task.detached(priority: .userInitiated) {
+                let namingSession = LanguageModelSession(instructions: systemInstruction)
+                let response = try await namingSession.respond(to: namingPrompt)
+                return response.content
+            }.value
+            let trimmed = responseText
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\"'."))
             session.title = trimmed.isEmpty ? fallback : "✦ " + trimmed
+            FreezeLogger.shared.log(
+                "autoname_model_call_finished",
+                sessionID: autonameSessionID,
+                durationMs: Date().timeIntervalSince(namingStartedAt) * 1000
+            )
         } catch {
             session.title = fallback
+            FreezeLogger.shared.log(
+                "autoname_model_call_failed",
+                level: .error,
+                sessionID: autonameSessionID,
+                metadata: ["error": String(describing: type(of: error))]
+            )
         }
         try? modelContext.save()
 #else
         session.title = fallback
         try? modelContext.save()
 #endif
+
+        FreezeLogger.shared.log("autoname_finished", sessionID: session.id)
     }
 
     private func isDisplayableFragment(_ fragment: String) -> Bool {
@@ -335,5 +725,45 @@ final class IntelligenceService: ObservableObject {
             return intelligenceError.localizedDescription
         }
         return error.localizedDescription
+    }
+
+    // MARK: - Prewarm
+
+    /// Fire-and-forget: caches model weights and KV-state for the current conversation
+    /// prefix so the first real token arrives faster after the user sends.
+    func prewarm(for session: ChatSession) {
+#if canImport(FoundationModels)
+        guard case .available = SystemLanguageModel.default.availability else { return }
+        let snapshot = session.systemPromptSnapshot
+        let systemPromptBudget = AIContextBuilder.estimatedTokens(forTranscript: snapshot)
+        let transcript = AIContextBuilder.transcript(for: session, systemPromptBudget: systemPromptBudget)
+        Task.detached(priority: .background) {
+            let modelSession = LanguageModelSession(instructions: snapshot)
+            modelSession.prewarm(promptPrefix: Prompt(transcript))
+        }
+#endif
+    }
+
+    // MARK: - Adaptive Watchdog Helpers
+
+    /// Records a successful first-token latency into a capped ring buffer (last 5 values).
+    private func recordFirstTokenLatency(_ ms: Double) {
+        var recent = UserDefaults.standard.array(forKey: "intrai.recentFirstTokenMs") as? [Double] ?? []
+        recent.append(ms)
+        if recent.count > 5 { recent.removeFirst(recent.count - 5) }
+        UserDefaults.standard.set(recent, forKey: "intrai.recentFirstTokenMs")
+    }
+
+    /// Returns the adaptive startup watchdog duration in seconds.
+    /// Uses p90 of recent first-token latencies × 1.5, clamped to [15, 25].
+    /// Falls back to 15 s when no history exists (the old hardcoded value was 12 s,
+    /// which fired too eagerly against the observed 13.5 s real-world first-token latency).
+    private func adaptiveStartupWatchdogSeconds() -> Double {
+        let recent = UserDefaults.standard.array(forKey: "intrai.recentFirstTokenMs") as? [Double] ?? []
+        guard !recent.isEmpty else { return 15 }
+        let sorted = recent.sorted()
+        let idx = max(0, Int((Double(sorted.count - 1) * 0.9).rounded()))
+        let p90ms = sorted[idx]
+        return min(max(p90ms / 1000.0 * 1.5, 15), 25)
     }
 }

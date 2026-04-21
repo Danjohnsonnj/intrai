@@ -21,8 +21,8 @@ final class UserMemory {
     }
 
     func update(facts: String, systemPrompt: String) {
-        self.facts = facts
-        self.systemPrompt = systemPrompt
+        self.facts = facts.normalizedWhitespace
+        self.systemPrompt = systemPrompt.normalizedWhitespace
         self.updatedAt = Date()
     }
 
@@ -35,5 +35,15 @@ final class UserMemory {
         let memory = UserMemory()
         context.insert(memory)
         return memory
+    }
+}
+
+private extension String {
+    /// Collapses runs of 3+ newlines to 2, and trims leading/trailing whitespace.
+    var normalizedWhitespace: String {
+        let collapsed = self.replacingOccurrences(
+            of: "\n{3,}", with: "\n\n", options: .regularExpression
+        )
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
