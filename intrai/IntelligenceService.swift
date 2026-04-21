@@ -47,7 +47,7 @@ struct LocalFirstChatResponder: ChatResponding {
     // The startup watchdog in IntelligenceService is the primary safety net for hangs.
     func streamResponse(systemPromptSnapshot: String, transcript: String) -> AsyncThrowingStream<String, Error> {
 #if canImport(FoundationModels)
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let innerTask = Task.detached(priority: .userInitiated) {
                 do {
                     let model = SystemLanguageModel.default
@@ -81,6 +81,49 @@ struct LocalFirstChatResponder: ChatResponding {
             continuation.finish(throwing: IntelligenceError.unavailableModel("FoundationModels is unavailable in this build target."))
         }
 #endif
+    }
+}
+
+/// Thread-safe context shared between the generation task and the mid-stream stall watchdog.
+/// The watchdog reads fragment timestamps and cancels the task without ever hopping to MainActor,
+/// so a FoundationModels hang that holds the actor cannot prevent auto-recovery.
+private final class WatchdogContext: @unchecked Sendable {
+    private let lock = NSLock()
+    nonisolated(unsafe) private var _lastFragmentAt: Date?
+    nonisolated(unsafe) private var _isActive = true
+    nonisolated(unsafe) private var _isStalled = false
+
+    nonisolated func recordFragment() {
+        lock.lock(); defer { lock.unlock() }
+        _lastFragmentAt = Date()
+    }
+
+    nonisolated func deactivate() {
+        lock.lock(); defer { lock.unlock() }
+        _isActive = false
+    }
+
+    nonisolated func markStalled() {
+        lock.lock(); defer { lock.unlock() }
+        _isStalled = true
+        _isActive = false
+    }
+
+    nonisolated var isActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isActive
+    }
+
+    nonisolated var isStalled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isStalled
+    }
+
+    /// Returns elapsed ms since last fragment, or nil if no fragment has arrived yet.
+    nonisolated func elapsedMsSinceLastFragment() -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard let t = _lastFragmentAt else { return nil }
+        return Date().timeIntervalSince(t) * 1000
     }
 }
 
@@ -119,6 +162,13 @@ final class IntelligenceService: ObservableObject {
     @Published private(set) var retryBlockedBySessionID: [UUID: String] = [:]
 
     private let responder: ChatResponding
+#if canImport(FoundationModels)
+    // Holds one prewarmed LanguageModelSession per ChatSession.id.
+    // Populated by prewarm(for:); consumed once then cleared by send().
+    // Each session is used for exactly one streamResponse call so its internal
+    // transcript never accumulates state from multiple turns.
+    private var prewarmSessionCache: [UUID: (systemPrompt: String, session: LanguageModelSession)] = [:]
+#endif
 
     init(responder: ChatResponding) {
         self.responder = responder
@@ -246,12 +296,74 @@ final class IntelligenceService: ObservableObject {
             ]
         )
 
+        let systemPromptSnapshot = session.systemPromptSnapshot
+#if canImport(FoundationModels)
+        // Pop any prewarmed session for this conversation (use-once: each session is
+        // consumed by exactly one streamResponse call to avoid transcript accumulation).
+        let cachedLMSession: LanguageModelSession?
+        if let cached = prewarmSessionCache[sessionID],
+           cached.systemPrompt == systemPromptSnapshot {
+            cachedLMSession = cached.session
+        } else {
+            cachedLMSession = nil
+        }
+        prewarmSessionCache.removeValue(forKey: sessionID)
+        let stream: AsyncThrowingStream<String, Error> = AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let innerTask = Task.detached(priority: .userInitiated) {
+                do {
+                    let model = SystemLanguageModel.default
+                    switch model.availability {
+                    case .unavailable(let reason):
+                        continuation.finish(throwing: IntelligenceError.unavailableModel("Apple Intelligence unavailable: \(reason)."))
+                        return
+                    case .available: break
+                    }
+                    let lmSession = cachedLMSession ?? LanguageModelSession(instructions: systemPromptSnapshot)
+                    let responseStream = lmSession.streamResponse(to: transcript)
+                    // Fire-and-forget hop: FreezeLogger is @MainActor; inner task is detached.
+                    Task { @MainActor in
+                        FreezeLogger.shared.log("inner_stream_started", sessionID: sessionID, generationStamp: stamp)
+                    }
+                    for try await snapshot in responseStream {
+                        if Task.isCancelled {
+                            continuation.finish(throwing: CancellationError())
+                            return
+                        }
+                        continuation.yield(snapshot.content)
+                    }
+                    Task { @MainActor in
+                        FreezeLogger.shared.log("inner_stream_finished", sessionID: sessionID, generationStamp: stamp)
+                    }
+                    continuation.finish()
+                } catch {
+                    Task { @MainActor in
+                        FreezeLogger.shared.log(
+                            "inner_stream_error",
+                            level: .error,
+                            sessionID: sessionID,
+                            generationStamp: stamp,
+                            metadata: ["errorType": String(describing: type(of: error))]
+                        )
+                    }
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                innerTask.cancel()
+            }
+        }
+#else
         let stream = responder.streamResponse(
-            systemPromptSnapshot: session.systemPromptSnapshot,
+            systemPromptSnapshot: systemPromptSnapshot,
             transcript: transcript
         )
+#endif
         FreezeLogger.shared.log("stream_initialized", sessionID: sessionID, generationStamp: stamp)
 
+        // WatchdogContext is created per-generation and shared with the mid-stream watchdog
+        // closure. It provides thread-safe fragment timestamps so the watchdog never needs to
+        // hop to MainActor — critical when FoundationModels holds the actor during a hang.
+        let watchdogContext = WatchdogContext()
         let task = Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -260,6 +372,9 @@ final class IntelligenceService: ObservableObject {
             var assistantMessage: ChatMessage?
 
             defer {
+                // Signal the watchdog to stop — prevents spurious stall detection after
+                // the generation ends normally or via external cancel.
+                watchdogContext.deactivate()
                 // Only clean up shared state if we are still the active generation.
                 // A newer send() may have already overwritten these entries.
                 if self.generationStampsBySessionID[sessionID] == stamp {
@@ -279,7 +394,23 @@ final class IntelligenceService: ObservableObject {
             }
 
             do {
+                // Throttle SwiftUI text writes to at most one per 250ms.
+                // Every iteration still updates lastFragmentTimestampByStamp so the
+                // mid-stream stall watchdog retains full timing accuracy.
+                // latestFragment always holds the most recent snapshot so the post-loop
+                // final commit guarantees the complete text is always persisted.
+                var lastUIUpdateAt: Date = .distantPast
+                var latestFragment: String = ""
+                var uiUpdateCount = 0
+
                 for try await fragment in stream {
+                    // Sleep 1ms per iteration to genuinely release the main actor.
+                    // Task.yield() re-enqueues at the same .userInitiated priority and
+                    // Apple's docs explicitly state it is not starvation-safe at high
+                    // priority. A 1ms timer suspension lets the CFRunLoop, SwiftUI
+                    // render pass, and lower-priority watchdog tasks run between fragments.
+                    try await Task.sleep(for: .milliseconds(1))
+
                     if self.firstFragmentReceivedStamps.insert(stamp).inserted {
                         let firstTokenLatencyMs = self.sendStartedAtByStamp[stamp].map {
                             Date().timeIntervalSince($0) * 1000
@@ -298,6 +429,7 @@ final class IntelligenceService: ObservableObject {
                     let updatedFragmentCount = (self.fragmentCountByStamp[stamp] ?? 0) + 1
                     self.fragmentCountByStamp[stamp] = updatedFragmentCount
                     self.lastFragmentTimestampByStamp[stamp] = Date()
+                    watchdogContext.recordFragment()  // thread-safe mirror for off-MainActor watchdog
                     if updatedFragmentCount.isMultiple(of: 20) {
                         FreezeLogger.shared.log(
                             "fragment_sample",
@@ -321,7 +453,21 @@ final class IntelligenceService: ObservableObject {
                     }
 
                     // Fragments are cumulative snapshots — replace, never append.
-                    assistantMessage?.text = fragment
+                    // Throttled to 250ms to prevent O(n²) SwiftUI text layout pressure
+                    // on the main thread; the final commit below guarantees complete text.
+                    latestFragment = fragment
+                    let now = Date()
+                    if now.timeIntervalSince(lastUIUpdateAt) >= 0.25 {
+                        assistantMessage?.text = fragment
+                        lastUIUpdateAt = now
+                        uiUpdateCount += 1
+                    }
+                }
+
+                // Commit the final complete snapshot regardless of where the throttle
+                // gate last opened — ensures display and persistence always match.
+                if let msg = assistantMessage, !latestFragment.isEmpty {
+                    msg.text = latestFragment
                 }
 
                 if self.pendingCancellationSessionIDs.contains(sessionID) || Task.isCancelled {
@@ -341,7 +487,10 @@ final class IntelligenceService: ObservableObject {
                     sessionID: sessionID,
                     generationStamp: stamp,
                     durationMs: self.sendStartedAtByStamp[stamp].map { Date().timeIntervalSince($0) * 1000 },
-                    metadata: ["fragments": String(self.fragmentCountByStamp[stamp] ?? 0)]
+                    metadata: [
+                        "fragments": String(self.fragmentCountByStamp[stamp] ?? 0),
+                        "uiUpdates": String(uiUpdateCount)
+                    ]
                 )
 
                 let saveAssistantStartedAt = Date()
@@ -373,7 +522,7 @@ final class IntelligenceService: ObservableObject {
                         generationStamp: stamp
                     )
                     self.applyTimeoutGovernance(sessionID: sessionID, stamp: stamp)
-                } else if self.midStreamStalledStamps.remove(stamp) != nil {
+                } else if watchdogContext.isStalled {
                     self.errorsBySessionID[sessionID] = IntelligenceError.generationStalled.localizedDescription
                     FreezeLogger.shared.log(
                         "generation_stalled",
@@ -449,23 +598,64 @@ final class IntelligenceService: ObservableObject {
             await self.handleStartupWatchdogCheck(sessionID: sessionID, stamp: stamp)
         }
 
-        // PHASE 4: Mid-stream watchdog — detached polling timer that checks for a long
-        // gap between fragments and cancels if no fragment arrives for 45 seconds.
+        // PHASE 4: Mid-stream watchdog — operates entirely off-MainActor via WatchdogContext.
+        // A FoundationModels hang that holds the MainActor executor cannot prevent cancellation:
+        // WatchdogContext reads use NSLock (no actor hop required), and task.cancel() is safe
+        // to call from any concurrency domain.
+        // Worst-case detection: 7s stall threshold + 3s poll = 10s max.
         FreezeLogger.shared.log("mid_stream_watchdog_spawned", sessionID: sessionID, generationStamp: stamp)
-        Task.detached { [weak self] in
+        Task.detached { [task] in
+            var tickCount = 0
+            var hasArmed = false
             while true {
                 do {
-                    try await Task.sleep(for: .seconds(10))
+                    try await Task.sleep(for: .seconds(3))
                 } catch {
                     return
                 }
 
-                guard let self else { return }
-                let shouldContinue = await self.handleMidStreamWatchdogPoll(sessionID: sessionID, stamp: stamp)
+                guard watchdogContext.isActive else { return }
+                tickCount += 1
+                let currentTick = tickCount
 
-                if !shouldContinue {
-                    return
+                if currentTick.isMultiple(of: 3) {
+                    let elapsedStr = watchdogContext.elapsedMsSinceLastFragment().map { String(Int($0)) } ?? "none"
+                    Task { @MainActor in
+                        FreezeLogger.shared.log(
+                            "mid_stream_watchdog_tick",
+                            sessionID: sessionID,
+                            generationStamp: stamp,
+                            metadata: ["tick": String(currentTick), "elapsedMsSinceFragment": elapsedStr]
+                        )
+                    }
                 }
+
+                guard let elapsed = watchdogContext.elapsedMsSinceLastFragment() else { continue }
+
+                if !hasArmed {
+                    hasArmed = true
+                    Task { @MainActor in
+                        FreezeLogger.shared.log("mid_stream_watchdog_armed", sessionID: sessionID, generationStamp: stamp)
+                    }
+                }
+
+                guard elapsed >= 7_000 else { continue }
+
+                // Stall confirmed — cancel immediately without any MainActor hop, then log best-effort.
+                watchdogContext.markStalled()
+                task.cancel()
+                let capturedElapsed = elapsed
+                Task { @MainActor in
+                    FreezeLogger.shared.log(
+                        "mid_stream_stall_detected",
+                        level: .warning,
+                        sessionID: sessionID,
+                        generationStamp: stamp,
+                        durationMs: capturedElapsed,
+                        metadata: ["tick": String(currentTick)]
+                    )
+                }
+                return
             }
         }
 
@@ -548,10 +738,14 @@ final class IntelligenceService: ObservableObject {
         let updatedTickCount = (midStreamWatchdogTickCountByStamp[stamp] ?? 0) + 1
         midStreamWatchdogTickCountByStamp[stamp] = updatedTickCount
         if updatedTickCount.isMultiple(of: 3) {
+            let tickElapsedMs = lastFragmentTimestampByStamp[stamp].map { Date().timeIntervalSince($0) * 1000 }
+            var tickMeta: [String: String] = ["tick": String(updatedTickCount)]
+            if let ms = tickElapsedMs { tickMeta["elapsedMsSinceFragment"] = String(Int(ms)) }
             FreezeLogger.shared.log(
                 "mid_stream_watchdog_tick",
                 sessionID: sessionID,
-                generationStamp: stamp
+                generationStamp: stamp,
+                metadata: tickMeta
             )
         }
 
@@ -567,7 +761,9 @@ final class IntelligenceService: ObservableObject {
 
         guard let lastFragmentAt = lastFragmentTimestampByStamp[stamp] else { return true }
         let elapsedMs = Date().timeIntervalSince(lastFragmentAt) * 1000
-        guard elapsedMs >= 45_000 else { return true }
+        // 7-second gap with no new fragments is a definitive mid-inference hang.
+        // The previous 10s threshold gave up to 13s detection; 7s + 3s poll = 10s max.
+        guard elapsedMs >= 7_000 else { return true }
 
         midStreamStalledStamps.insert(stamp)
         FreezeLogger.shared.log(
@@ -737,9 +933,16 @@ final class IntelligenceService: ObservableObject {
         let snapshot = session.systemPromptSnapshot
         let systemPromptBudget = AIContextBuilder.estimatedTokens(forTranscript: snapshot)
         let transcript = AIContextBuilder.transcript(for: session, systemPromptBudget: systemPromptBudget)
-        Task.detached(priority: .background) {
+        let sessionID = session.id
+        Task.detached(priority: .background) { [weak self] in
             let modelSession = LanguageModelSession(instructions: snapshot)
             modelSession.prewarm(promptPrefix: Prompt(transcript))
+            // Cache the warmed session so the next send() for this conversation can
+            // reuse it, bypassing cold-start main-thread initialization in FoundationModels.
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.prewarmSessionCache[sessionID] = (systemPrompt: snapshot, session: modelSession)
+            }
         }
 #endif
     }

@@ -21,6 +21,21 @@ final class FreezeLogger {
     private var heartbeatTimer: DispatchSourceTimer?
     private var lastStallLogAt = Date.distantPast
 
+    /// Events for which the disk log is flushed synchronously after persist so
+    /// they survive a force-quit that may follow within seconds.
+    private static let criticalEvents: Set<String> = [
+        "mid_stream_stall_detected",
+        "watchdog_timeout_fired",
+        "generation_timeout",
+        "generation_stalled",
+        "inner_stream_error",
+        "main_thread_stall",
+        // Tick events are flushed immediately so per-poll elapsed times survive force-quit.
+        // inner_stream_started flushed immediately so model-hang vs UI-lock is always on disk.
+        "mid_stream_watchdog_tick",
+        "inner_stream_started"
+    ]
+
     private(set) var currentScenePhase = "unknown"
     private(set) var memoryWarningCount = 0
 
@@ -91,8 +106,14 @@ final class FreezeLogger {
         )
 
         append(entry)
+        let isCritical = Self.criticalEvents.contains(entry.event)
         Task(priority: .utility) {
             DiskFreezeLogger.shared.persist(entry)
+            // For critical events, flush immediately so the write survives a force-quit
+            // that may follow within seconds of the stall/timeout being detected.
+            if isCritical {
+                DiskFreezeLogger.shared.flush()
+            }
         }
         logger.log("[\(entry.level.rawValue)] \(entry.event, privacy: .public) sid=\(entry.sessionID?.uuidString ?? "-", privacy: .public) stamp=\(entry.generationStamp?.uuidString ?? "-", privacy: .public) durMs=\(entry.durationMs ?? -1, privacy: .public)")
     }
@@ -137,7 +158,10 @@ final class FreezeLogger {
 
                 let lag = Date().timeIntervalSince(sentAt)
                 guard lag > 1.0 else { return }
-                guard Date().timeIntervalSince(self.lastStallLogAt) >= 30 else { return }
+                // 2-second cooldown: short enough to capture mid-stream stalls that
+                // previously fell inside the 30-second blind window, long enough to
+                // prevent duplicate log spam on back-to-back heartbeat ticks.
+                guard Date().timeIntervalSince(self.lastStallLogAt) >= 2 else { return }
 
                 self.lastStallLogAt = Date()
                 self.log(

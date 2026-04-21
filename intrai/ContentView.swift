@@ -222,6 +222,8 @@ private struct MemorySettingsView: View {
     @State private var diagnosticsExportError: String?
     @State private var showingContextWarning = false
 
+    private let diagnosticsBuildVersion = "0.2.104"
+
     private var combinedTokenEstimate: Int {
         let combined = systemPromptDraft + "\n" + factsDraft
         let chars = Double(combined.utf16.count)
@@ -273,6 +275,16 @@ private struct MemorySettingsView: View {
                         Text(diagnosticsExportError)
                             .font(.footnote)
                             .foregroundStyle(.red)
+                    }
+                }
+
+                Section {
+                    HStack {
+                        Spacer()
+                        Text("Diagnostics Build \(diagnosticsBuildVersion)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Spacer()
                     }
                 }
             }

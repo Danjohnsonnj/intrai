@@ -147,6 +147,11 @@ final class DiskFreezeLogger {
             "first_fragment_received",
             "fragment_sample",
             "mid_stream_stall_detected",
+            // Inner detached-stream lifecycle: critical for model-hang vs UI-lock disambiguation.
+            // These events survive force-quit only when persisted here AND flushed immediately.
+            "inner_stream_started",
+            "inner_stream_finished",
+            "inner_stream_error",
             "stream_completed",
             "save_assistant_message_end",
             "generation_timeout",

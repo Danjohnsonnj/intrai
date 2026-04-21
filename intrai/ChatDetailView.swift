@@ -63,10 +63,15 @@ struct ChatDetailView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(sortedMessages, id: \.id) { message in
-                            ChatMessageBubble(message: message) {
+                            ChatMessageBubble(
+                                message: message,
+                                isStreaming: isGenerating
+                                    && message.validatedRole == .assistant
+                                    && message.id == sortedMessages.last?.id
+                            ) {
                                 copyMessageAsMarkdown(message)
                             }
-                                .id(message.id)
+                            .id(message.id)
                         }
 
                         if isGenerating {
@@ -245,6 +250,12 @@ struct ChatDetailView: View {
                 generationStartedAt = nil
                 elapsedTimerTask?.cancel()
                 elapsedTimerTask = nil
+                // Log the moment the last assistant bubble switches from plain-text
+                // streaming mode to the finalized markdown render. One event per generation.
+                FreezeLogger.shared.log(
+                    "render_mode_switched_to_markdown",
+                    sessionID: session.id
+                )
             }
         }
         .onChange(of: draftMessage) { _, newValue in
@@ -403,6 +414,7 @@ private struct SessionSnapshotView: View {
 
 private struct ChatMessageBubble: View {
     let message: ChatMessage
+    let isStreaming: Bool
     let onCopyAsMarkdown: () -> Void
 
     var body: some View {
@@ -419,6 +431,11 @@ private struct ChatMessageBubble: View {
                     .foregroundStyle(.secondary)
 
                 if isUser {
+                    Text(message.text)
+                } else if isStreaming {
+                    // Plain text during streaming — avoids O(n²) full-text markdown
+                    // re-parsing on the main thread for every incoming fragment.
+                    // Switches to the full Markdown render once generation completes.
                     Text(message.text)
                 } else {
                     Markdown(message.text)
