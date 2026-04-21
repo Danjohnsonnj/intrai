@@ -39,6 +39,10 @@ struct ChatDetailView: View {
         intelligenceService.isGenerating(for: session)
     }
 
+    private var isWaitingForFirstFragment: Bool {
+        isGenerating && sortedMessages.last?.validatedRole != .assistant
+    }
+
     private var contextProgress: Double {
         intelligenceService.contextProgress(for: session)
     }
@@ -68,9 +72,9 @@ struct ChatDetailView: View {
                         if isGenerating {
                             HStack(spacing: 8) {
                                 ProgressView()
-                                Text(generationElapsedSeconds < 10
-                                     ? "Generating... \(generationElapsedSeconds)s"
-                                     : "Apple Intelligence is taking a moment... \(generationElapsedSeconds)s")
+                                Text(isWaitingForFirstFragment
+                                     ? "Thinking... \(generationElapsedSeconds)s"
+                                     : "Generating...")
                                     .font(.footnote)
                                     .foregroundStyle(.secondary)
 
