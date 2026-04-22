@@ -432,6 +432,8 @@ already-fragile framework.
 
 ### 11.1 Earlier FoundationModels framework initialization
 
+**Active plan:** [`~/.cursor/plans/framework_readiness_gate_b59a72b8.plan.md`](../../../.cursor/plans/framework_readiness_gate_b59a72b8.plan.md) — implements both subsections A (shift init earlier) and B (gate UI on readiness) below. Targets diagnostics build `0.2.114`.
+
 **Observed behavior.** `loadRuntimeLimits()` is called from
 `ContentView.onAppear` and completes in ~41 ms. However, the first access to
 `SystemLanguageModel.default` triggers lazy framework initialization — the
@@ -536,6 +538,7 @@ strongest signal in the investigation. The most impactful next steps are:
 2. **§11.1** (framework readiness gate) — prevents the force-quit cascade and
    eliminates false watchdog triggers from the init burst. Implementable without
    Apple involvement and improves UX regardless of root-cause resolution.
+   Plan: [`~/.cursor/plans/framework_readiness_gate_b59a72b8.plan.md`](../../../.cursor/plans/framework_readiness_gate_b59a72b8.plan.md).
 3. **§12.2** (disable autoname) — still an open hypothesis. The §12.3 log does
    not include autoname events, so it cannot be evaluated from that data.
    Low-effort to test: flip `autonameEnabled` to `false`, reproduce the 3-send
