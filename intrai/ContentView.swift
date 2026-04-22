@@ -311,7 +311,7 @@ private struct MemorySettingsView: View {
     @State private var diagnosticsExportError: String?
     @State private var showingContextWarning = false
 
-    private let diagnosticsBuildVersion = "0.2.111"
+    private let diagnosticsBuildVersion = "0.2.112"
 
     private var combinedTokenEstimate: Int {
         let combined = systemPromptDraft + "\n" + factsDraft

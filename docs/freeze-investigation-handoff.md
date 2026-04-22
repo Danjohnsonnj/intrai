@@ -1,8 +1,8 @@
 # Freeze Investigation Hand-off (Current)
 
 **Last updated:** 2026-04-22  
-**Current diagnostics build label:** 0.2.111  
-**Status:** Unresolved at framework level; mitigation and recovery layers are active.
+**Current diagnostics build label:** 0.2.112  
+**Status:** Unresolved at framework level; mitigation and recovery layers are active. 0.2.112 removes `swift-markdown-ui` per experiment §10.1. Field testing confirms MarkdownUI is **not** the root cause — freezes and post-freeze relaunch failures reproduce without it. Root cause is `FoundationModels` framework initialization and generation-layer wedging. See §12 for the 0.2.112 field incident log.
 
 ---
 
@@ -19,7 +19,9 @@ forward progress. We cannot fix the framework itself, so current work focuses on
 
 The codebase has moved beyond earlier 0.2.10x streaming architecture. As of
 0.2.111, user-visible responses are generated as a single finalized block
-(`respond(to:options:)`) rather than token streaming.
+(`respond(to:options:)`) rather than token streaming. 0.2.112 additionally
+removes the `swift-markdown-ui` dependency so assistant bubbles render as
+plain `Text` — see §10.1 for rationale and §10.2 for follow-up options.
 
 ---
 
@@ -44,6 +46,20 @@ Failure-handling path:
   intentionally so iOS can relaunch cleanly; next launch can surface a
   one-time explanatory banner using persisted diagnostics.
 
+Known additional failure modes (observed in 0.2.112 field testing):
+
+- **Framework init wedge at launch.** Repeated main-thread stalls (1–14 s)
+  occur between `runtime_limits_loaded` and first user interaction. These
+  have `sid=-` and are caused by `FoundationModels` lazy Neural Engine
+  initialization, not by any app-layer call.
+- **Post-force-quit relaunch failure.** After a force-quit during a wedge,
+  the framework's Neural Engine context may remain partially live. On next
+  launch the initialization burst can become permanently wedged, leaving the
+  app stuck on the loading screen indefinitely. Recovery requires a device
+  reboot or app reinstall. The watchdog and abort path cannot protect against
+  this because the wedge occurs before any user interaction and before the
+  watchdog arms.
+
 ---
 
 ## 3. Source-of-Truth Files
@@ -59,7 +75,7 @@ Failure-handling path:
 
 ---
 
-## 4. Current Architecture (0.2.111)
+## 4. Current Architecture (0.2.112)
 
 ### 4.1 Generation mode
 
@@ -135,7 +151,7 @@ Diagnostics survive force-quit through disk persistence and direct writes.
 Diagnostics build label in `MemorySettingsView` is currently:
 
 ```swift
-private let diagnosticsBuildVersion = "0.2.111"
+private let diagnosticsBuildVersion = "0.2.112"
 ```
 
 Increment on each diagnostics-significant build to keep exported logs
@@ -189,6 +205,20 @@ to GCD timers" are complete and should not be re-listed as future work.
   guarantee elimination of framework wedges.
 - Intentionally aborting on unrecoverable MainActor wedge is a product decision:
   it favors predictable recovery over indefinite frozen UI.
+- **MarkdownUI is not the root cause.** Removed in 0.2.112. Freezes and
+  relaunch failures reproduce without it. See §10.1 and §12.
+- **Framework initialization is independently destabilizing.** Repeated
+  main-thread stalls occur at every app launch before any generation is
+  attempted. The `FoundationModels` framework performs lazy Neural Engine
+  initialization on first `SystemLanguageModel.default` access, and this
+  process blocks the main thread in multi-second bursts regardless of whether
+  any prompt is sent.
+- **Force-quit can leave the framework in an unrecoverable state.** A
+  force-quit during an active wedge may prevent clean relaunch. Device reboot
+  is the only known recovery path. This failure mode is outside the app's
+  control but motivates the §11.1 UI-readiness gate (to reduce the frequency
+  of force-quits by making the initialization period visible and non-
+  interactive).
 
 ---
 
@@ -209,11 +239,11 @@ Previous fix attempts focused exclusively on the generation/watchdog layer.
 The experiments below widen the lens to include rendering, dependency health,
 and interaction effects that have not yet been isolated.
 
-### 10.1 Isolate MarkdownUI as a freeze contributor
+### 10.1 Isolate MarkdownUI as a freeze contributor — **landed in 0.2.112**
 
-**Why this is high priority.** Assistant messages are rendered via
+**Why this was high priority.** Assistant messages were previously rendered via
 `Markdown(message.text)` (gonzalezreal/swift-markdown-ui 2.4.1) inside a
-`LazyVStack`. This library has multiple open, unfixed performance bugs that
+`LazyVStack`. That library has multiple open, unfixed performance bugs that
 cause MainActor hangs:
 
 - **Issue #310:** A short string with 6-level nested bullets causes a 1-2 s
@@ -225,8 +255,8 @@ cause MainActor hangs:
 - **Issue #396:** Long code snippets crash (`EXC_BAD_ACCESS`) on iOS.
 
 The on-device model can and does produce nested lists and code blocks. If the
-response triggers any of these MarkdownUI pathologies, the MainActor will be
-blocked for seconds *after* generation completes. This could:
+response triggered any of these MarkdownUI pathologies, the MainActor would be
+blocked for seconds *after* generation completes, which could:
 
 - Extend the apparent freeze window beyond what the watchdog expects.
 - Delay the MainActor hop in the force-recovery pipeline, causing the abort
@@ -234,10 +264,27 @@ blocked for seconds *after* generation completes. This could:
 - Compound with a borderline-slow generation to push total wall-clock time
   past the 25 s deadline.
 
-**Experiment:** Temporarily replace `Markdown(message.text)` with plain
-`Text(message.text)` for assistant bubbles and run the same prompt set that
-triggers freezes. If freezes disappear or become reliably recoverable, the
-rendering layer is a significant contributor or the sole remaining cause.
+**What changed in 0.2.112.**
+
+- `ChatMessageBubble` now renders assistant bubbles with plain
+  `Text(message.text).textSelection(.enabled)`. The raw model string is
+  displayed verbatim; no parsing or view-tree transformation happens in-app.
+- `import MarkdownUI` was removed from `ChatDetailView.swift`.
+- The `swift-markdown-ui` SPM package reference and its `MarkdownUI` product
+  dependency were removed from `project.pbxproj` (5 locations). On the next
+  Xcode resolve, `Package.resolved` will drop `swift-markdown-ui`,
+  `NetworkImage`, and `swift-cmark`.
+- `ChatExport.markdown(for:)` and the long-press "copy as Markdown" actions
+  are pure string operations and continue to work — the raw model output is
+  already Markdown-formatted, so export fidelity is unchanged.
+
+**Result (0.2.112 field test, 2026-04-22).** MarkdownUI is ruled out. Freezes
+and the post-force-quit relaunch failure reproduced with plain `Text` rendering
+and no `swift-markdown-ui` in the binary. The freeze occurs during framework
+initialization before any generation is attempted, and during generation on
+multi-turn exchanges. See §12 for full incident details. §10.2 (replacement
+rendering library) is deprioritized; focus should return to the `FoundationModels`
+generation-wedge hypothesis and §11.1 (framework readiness gate).
 
 ### 10.2 Evaluate MarkdownUI replacement
 
@@ -293,26 +340,42 @@ rendering-layer instability.
 
 ### 10.5 Tune watchdog thresholds from field data
 
-With rendering impact quantified (10.1-10.3), revisit:
+With MarkdownUI ruled out (§10.1), the rendering-layer qualifier no longer
+applies. Current guidance:
 
-- `proactiveWedgeThresholdMs` — may need to increase if MarkdownUI rendering
-  legitimately occupies 1-2 s of MainActor time post-generation.
-- `mainActorWedgeAbortSeconds` — should be set above the worst observed
-  render time to avoid false aborts.
-- `generationDeadlineSeconds` — can potentially be tightened once rendering
-  cost is moved off the critical path or reduced.
+- `proactiveWedgeThresholdMs` — with MarkdownUI gone, any main-thread stall
+  exceeding this threshold is attributable to framework initialization or
+  generation, not rendering. The threshold can potentially be tightened.
+- `mainActorWedgeAbortSeconds` — field data shows initialization-phase stalls
+  of up to ~14 s; the abort timer must remain above this to avoid false aborts
+  during the init burst. Consider gating the watchdog arm on `frameworkReady`
+  (see §11.1) so initialization stalls are never seen by the watchdog at all.
+- `generationDeadlineSeconds` — can potentially be tightened now that rendering
+  is off the critical path.
 
 ### 10.6 Apple Feedback Assistant escalation
 
-Build a minimal standalone app:
+**Elevated priority** given confirmed framework-level init wedge and post-
+force-quit relaunch failure (§12). Build a minimal standalone app:
 
 - Single-view, no MarkdownUI, no SwiftData.
-- Calls `LanguageModelSession.respond(to:options:)` with a transcript near
-  the 4096-token context window.
-- Logs wall-clock time, thread state, and whether the call returns or hangs.
+- Accesses `SystemLanguageModel.default.availability` and `.contextSize` on
+  launch to reproduce the initialization burst.
+- Calls `LanguageModelSession.respond(to:options:)` with a 2-turn transcript.
+- Logs wall-clock time, thread state, main-thread heartbeat, and whether each
+  call returns or hangs.
 
-File with Apple alongside device logs and diagnostics exports from the main
-app. The minimal repro eliminates all app-specific variables and gives Apple
+File two separate reports with Apple:
+
+1. **Init-phase main-thread stalls** — `SystemLanguageModel.default` access
+   at launch causes repeated 1–14 s main-thread stalls before any generation.
+   Include the `main_thread_stall` sequence from §12.
+2. **Post-force-quit relaunch failure** — force-quitting during an active
+   generation wedge leaves the framework in a state where subsequent app
+   launches wedge on the loading screen indefinitely. Include the full
+   incident description from §12.
+
+The minimal repro eliminates all app-specific variables and gives Apple
 engineers the clearest signal.
 
 ### 10.7 Evaluate streaming re-enablement (longer term)
@@ -330,8 +393,201 @@ improve perceived responsiveness. Gate this on:
 
 ---
 
-**Guiding principle:** The most impactful next step is likely 10.1 — it is
-fast, low-risk, and tests a hypothesis that has never been isolated despite
-multiple rounds of generation-layer debugging. If MarkdownUI rendering is
-compounding or masking the true recovery behavior, all watchdog tuning done
-without that knowledge is built on incomplete data.
+## 11. General Performance Optimization Initiative
+
+Independent of the root freeze investigation, field diagnostics from build
+0.2.112 reveal a class of inefficiency that may be compounding the root issue
+even if it is not causing it. These observations motivate a broader effort to
+remove unnecessary main-thread load, thread-blocking operations, and memory
+pressure from the app — reducing the surface area that interacts badly with an
+already-fragile framework.
+
+> **Note:** The items in this section are not directly implicated in the freeze
+> mechanism described in §§1–9. However, any inefficiency that occupies the
+> main thread, inflates memory pressure, or introduces unexpected blocking
+> increases the probability that a borderline `FoundationModels` call tips into
+> a full wedge. Addressing them is low-risk and produces measurable UX
+> improvements regardless of root-cause outcome.
+
+### 11.1 Earlier FoundationModels framework initialization
+
+**Observed behavior.** `loadRuntimeLimits()` is called from
+`ContentView.onAppear` and completes in ~41 ms. However, the first access to
+`SystemLanguageModel.default` triggers lazy framework initialization — the
+Neural Engine context setup, internal reporter registration, and result
+accumulator allocation — which causes repeated main-thread stalls of 1–14 s
+*after* `runtime_limits_loaded` is logged. These stalls appear with `sid=-`
+(no active session), confirming they are framework-level and not generation-
+or render-layer. Associated framework log noise:
+
+```
+Result accumulator timeout: 3.000000, exceeded.
+Reporter disconnected. { function=sendMessage, ... }
+Attempted to update accumulator from source type: X, after completion has
+already been called for token:[...]
+```
+
+The app has no awareness that this initialization window is open. The UI
+appears fully ready while the framework is still settling, so the first user
+action (tapping New Chat, composing a message) hits the main thread while it
+is still absorbing initialization bursts.
+
+**Two actionable improvements:**
+
+**A. Shift initialization earlier.** Move the first `SystemLanguageModel.default`
+access to the earliest possible app lifecycle point — `intraiApp.init()` or a
+detached task spawned from `@main` — so the framework initialization window
+overlaps with the launch sequence rather than occurring while the user is
+actively navigating. Total stall time is unchanged; perceived impact is
+reduced because the stalls happen before the UI is interactive.
+
+**B. Gate UI on framework readiness.** Add a `frameworkReady: Bool` state to
+`IntelligenceService` (or a lightweight `FoundationModelsReadinessMonitor`
+observable) that starts `false` and flips to `true` after the initialization
+burst has settled. Surface this state in `ContentView` and `ChatDetailView`
+to:
+
+- Disable the New Chat button and composer until `frameworkReady` is `true`.
+- Show a brief, non-alarming indicator (e.g. a muted "AI initializing…" label
+  in the toolbar or a disabled compose field with placeholder text).
+- Prevent navigation into `ChatDetailView` when the framework is not yet
+  ready — avoiding the scenario where the user enters a chat, the device
+  freezes, and there is no recovery indicator.
+
+Detecting readiness is non-trivial because `FoundationModels` does not expose
+an explicit "ready" event. Pragmatic approaches:
+
+- Poll `SystemLanguageModel.default.availability` at a short interval from a
+  background task until it returns `.available` with stable timing (i.e. two
+  consecutive fast polls).
+- Use a fixed settling delay (e.g. 3–5 s after `runtime_limits_loaded`) as a
+  conservative heuristic.
+- Monitor main-thread heartbeat degradation via the existing proactive wedge
+  detector — flip `frameworkReady` only after the heartbeat returns to
+  baseline.
+
+**Expected outcome.** Even without resolving the root freeze cause, this
+change eliminates the "app looks ready but isn't" UX failure and prevents
+watchdog false-positives where an initialization-phase stall is
+misclassified as a generation wedge.
+
+### 11.2 Audit for other synchronous main-thread work at navigation time
+
+The 0.2.112 session also shows main-thread stalls when navigating to a new
+`ChatDetailView` even after startup completes. Beyond framework init, common
+sources of unintentional main-thread work at navigation time include:
+
+- SwiftData fetch descriptors executing synchronously on the main actor.
+- `@Model` property access triggering fault resolution across a large object
+  graph.
+- `.onAppear` closures performing non-trivial computation before yielding.
+
+A focused audit of `ChatDetailView.onAppear`, any `@Query` property wrappers
+in the view hierarchy, and `IntelligenceService` state mutations triggered by
+session selection would identify any additional contributors.
+
+### 11.3 Memory pressure baseline
+
+High memory pressure increases the probability of the OS pre-empting
+background threads (including the cooperative thread pool) to reclaim pages,
+which can extend or trigger wedges. A baseline memory profile (Xcode
+Instruments → Allocations + Leaks) across a typical session lifecycle would
+confirm whether retained `LanguageModelSession` objects, cached transcripts,
+or SwiftData fault buffers are accumulating across sessions. Known candidates:
+
+- `LanguageModelSession` instances — currently created fresh per generation
+  but should be verified as deallocated promptly after `respond(to:)` returns.
+- `AIContextBuilder` transcript strings — these can be large for long sessions
+  and are currently rebuilt on every send.
+- `FreezeLogger` in-memory event buffer — confirm it is bounded and flushed
+  to disk on backgrounding.
+
+---
+
+**Guiding principle (updated 2026-04-22).** §10.1 is complete — MarkdownUI is
+ruled out. The most impactful next steps are now:
+
+1. **§11.1** (framework readiness gate) — directly prevents the force-quit
+   failure cascade and eliminates false watchdog triggers from the init burst.
+   Implementable without Apple involvement.
+2. **§10.6** (Apple Feedback Assistant escalation) — the init wedge and
+   post-force-quit relaunch failure are strong repro cases for two separate
+   feedback reports.
+3. **§10.5** (watchdog threshold tuning) — can be done once §11.1 separates
+   the init window from the generation window.
+
+The §11 initiative is complementary: it addresses confirmed inefficiencies
+that are observable right now, produces immediate UX improvements, and
+reduces the ambient load under which the `FoundationModels` framework
+operates — making all root-cause experiments cleaner and more attributable.
+
+---
+
+## 12. Field Incident Log
+
+### 12.1 Build 0.2.112 — 2026-04-22
+
+**Device:** Physical iPhone (iOS 26)  
+**Build:** 0.2.112 (fresh install after clean delete)  
+**Outcome:** Freeze on second multi-turn message; app stuck on loading screen
+after force-quit; required device reboot to recover.
+
+#### Sequence of events
+
+**App launch (fresh install):**
+- CoreData `Application Support` directory did not yet exist → expected first-
+  launch diagnostic noise; `Recovery attempt... was successful` confirmed clean
+  creation. No concern.
+- `runtime_limits_loaded` fired at 41 ms — `loadRuntimeLimits()` itself was
+  fast.
+- Immediately after, repeated main-thread stalls of 4–14 s (`sid=-`) with no
+  user interaction and no generation in flight:
+  ```
+  main_thread_stall durMs=4277, 9778, 13649, 10558, 9267
+  ```
+  These are caused by `FoundationModels` lazy Neural Engine initialization
+  triggered by the first `SystemLanguageModel.default` access.
+
+**New chat navigation (before any prompt):**
+- Further main-thread stalls (1–6 s) with `sid=-`.
+- Framework-internal log noise:
+  ```
+  Result accumulator timeout: 3.000000, exceeded.
+  Reporter disconnected. { function=sendMessage, ... }
+  Attempted to update accumulator from source type: X, after completion
+    has already been called for token:[...]
+  ```
+  These are `FoundationModels` internal reporters timing out and disconnecting
+  during initialization. The app has no visibility into or control over these.
+
+**First message (simple prompt):**
+- Clean lifecycle: `send_start` → `generation_finished` in 3822 ms.
+- `generation_max_tokens` fired — response was token-capped as expected.
+- `autoname_model_call_finished` at 546 ms.
+- Device remained responsive.
+
+**Second message (multi-turn follow-up):**
+- App froze immediately after sending. No `send_start` event captured —
+  the debugger connection had already dropped due to the earlier init-phase
+  stalls, so no log events were recorded for this freeze.
+- The freeze did not self-resolve; user force-quit.
+
+**After force-quit:**
+- App stuck on loading screen on every relaunch attempt.
+- No crash report generated (force-quit produces SIGKILL, not a crash).
+- Device reboot required to restore normal launch behavior.
+
+#### Conclusions from this incident
+
+| Finding | Implication |
+|---------|-------------|
+| Freeze reproduced without MarkdownUI | MarkdownUI **ruled out** as root or compounding cause |
+| Stalls at `sid=-` before any generation | Root cause is `FoundationModels` init, not generation path |
+| First generation ran cleanly in 3.8 s | App-level generation path is healthy when framework is stable |
+| Post-force-quit relaunch failure | Force-quit during wedge can leave Neural Engine context partially live; subsequent launches wedge on init |
+| No crash report | Force-quit (SIGKILL) is not recorded; abort-path breadcrumbing would also not help here |
+
+#### Recovery
+
+Device reboot cleared the wedged Neural Engine state and restored normal
+launch behavior.

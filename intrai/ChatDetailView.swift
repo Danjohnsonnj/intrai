@@ -5,7 +5,6 @@
 
 import SwiftUI
 import SwiftData
-import MarkdownUI
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -479,20 +478,8 @@ private struct ChatMessageBubble: View {
                 if isUser {
                     Text(message.text)
                 } else {
-                    Markdown(message.text)
-                        .markdownTheme(
-                            .gitHub
-                                .text {
-                                    ForegroundColor(.primary)
-                                    BackgroundColor(nil)
-                                }
-                                .code {
-                                    FontFamilyVariant(.monospaced)
-                                    FontSize(.em(0.85))
-                                    ForegroundColor(.primary)
-                                    BackgroundColor(.secondary.opacity(0.15))
-                                }
-                        )
+                    Text(message.text)
+                        .textSelection(.enabled)
                 }
 
                 Text(message.timestamp, format: .dateTime.hour().minute())

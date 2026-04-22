@@ -10,8 +10,8 @@ All conversations stay on-device via SwiftData. The app uses Apple's `Foundation
 - **Auto-naming** — New chats are automatically named after the first exchange, prefixed with ✦. Long-press the chat title at any time to rename.
 - **Memory snapshot system** — A global system prompt and user memory are composed into a snapshot and frozen into each session at creation time. Snapshots can be refreshed per-session with a confirmation dialog.
 - **AI responses** — Complete responses are returned as a single block from `SystemLanguageModel.default` (strictly on-device; PCC is not used) with cancellation support. Generation is bounded by `GenerationOptions(maximumResponseTokens:)` to prevent runaway loops. A unified send watchdog arms at `send_start` and covers the entire pre-flight + generation window: an absolute 25 s deadline plus a proactive wedge detector that cancels within ~5–7 s when the main thread stops running. When the framework wedges the main actor past recovery, the app self-terminates so iOS can cleanly restart it; the next launch surfaces a one-time banner explaining what happened. The pre-flight context gate uses the synchronous char/token heuristic only — the real-tokenizer (`tokenCount(for:)`) call was removed in 0.2.111 after diagnostics showed it could wedge the same way `respond(to:)` can. The SDK's own `exceededContextWindowSize` error is still routed into the Trim / Start-new-chat UI path if the heuristic ever under-counts. Token-by-token streaming remains disabled while framework stability is investigated — see `docs/freeze-investigation-handoff.md`.
-- **Markdown rendering** — Assistant responses render full block Markdown (headings, code blocks, lists, bold/italic) via [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui). User messages are plain text.
-- **Markdown export** — Copy any conversation as plain-text Markdown from the chat menu, or long-press any message bubble to copy just that message as Markdown.
+- **Plain-text rendering** — Assistant responses are displayed as untransformed `Text` (selectable/copyable) while the freeze investigation rules out `swift-markdown-ui` as a compounding cause — see `docs/freeze-investigation-handoff.md` §10.1. Rich Markdown rendering may return once the root cause is confirmed. User messages are also plain text.
+- **Markdown export** — Copy any conversation as plain-text Markdown from the chat menu, or long-press any message bubble to copy just that message as Markdown. The raw model output is already Markdown-formatted, so export fidelity is unaffected by the in-app rendering change.
 - **Context usage progress bar** — A thin, always-visible bar above the composer estimates transcript context load. It fills left-to-right as conversations grow and uses monochrome styling by appearance mode (black in light mode, white in dark mode).
 - **Siri integration** — Say "Hey Siri, ask Intrai" to trigger a new chat via App Intents. Also runnable from the Shortcuts app.
 - **Secure deletion** — Swipe-to-delete a session and all associated messages are cascade-deleted.
@@ -25,7 +25,7 @@ All conversations stay on-device via SwiftData. The app uses Apple's `Foundation
 
 ## Architecture
 
-SwiftUI + SwiftData with a `@MainActor` service layer. One external dependency: [swift-markdown-ui](https://github.com/gonzalezreal/swift-markdown-ui) 2.4.1 (SPM).
+SwiftUI + SwiftData with a `@MainActor` service layer. No third-party dependencies as of 0.2.112 (`swift-markdown-ui` was removed to isolate a suspected UI-hang contributor — see `docs/freeze-investigation-handoff.md` §10.1).
 
 ```
 intrai/
@@ -51,7 +51,7 @@ intrai/
 | `ChatResponding` protocol | Abstracts the AI provider for testability; `LocalFirstChatResponder` is the production implementation |
 | `#if canImport(FoundationModels)` | Ensures the project compiles on simulators and targets without the framework |
 | Snapshot immutable by default | Refresh is an explicit user action requiring confirmation |
-| MarkdownUI for assistant bubbles | Full block-level rendering (code, headings, lists) not achievable with `AttributedString` alone |
+| Plain `Text` for assistant bubbles (0.2.112) | MarkdownUI removed to rule it out as a compounding freeze cause; raw model output is displayed verbatim with `.textSelection(.enabled)` |
 | `PendingIntentStore` singleton | Decouples App Intent execution (outside SwiftUI) from view observation without requiring Environment injection |
 
 ## Building
