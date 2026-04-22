@@ -16,6 +16,7 @@ struct ChatDetailView: View {
 
     let session: ChatSession
     @ObservedObject var intelligenceService: IntelligenceService
+    var onSelectSession: ((UUID) -> Void)? = nil
 
     @State private var draftMessage = ""
     @State private var showingSnapshotSheet = false
@@ -23,6 +24,7 @@ struct ChatDetailView: View {
     @State private var showingRenameAlert = false
     @State private var renameDraft = ""
     @State private var wasInputFocused = false
+    @State private var showingTrimConfirmation = false
     // Cached sort — re-evaluated only when the message count changes, not on every
     // keystroke render. Eliminates the O(n log n) sort on each frame during typing.
     // sortedMessages holds @Model reference-type objects: in-place mutations during
@@ -48,8 +50,12 @@ struct ChatDetailView: View {
     }
 
     private var progressBarColor: Color {
-        if contextProgress >= 0.8 { return .red.opacity(0.8) }
-        if contextProgress >= 0.5 { return .orange.opacity(0.7) }
+        // Thresholds align with AIContextBuilder risk tiers (yellow 0.40,
+        // orange 0.55, red 0.70) — red fires before the hang zone so users
+        // have warning while they still have room to keep chatting.
+        if contextProgress >= 0.70 { return .red.opacity(0.8) }
+        if contextProgress >= 0.55 { return .orange.opacity(0.7) }
+        if contextProgress >= 0.40 { return .yellow.opacity(0.75) }
         return colorScheme == .dark ? .white.opacity(0.3) : .green.opacity(0.6)
     }
 
@@ -63,12 +69,7 @@ struct ChatDetailView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(sortedMessages, id: \.id) { message in
-                            ChatMessageBubble(
-                                message: message,
-                                isStreaming: isGenerating
-                                    && message.validatedRole == .assistant
-                                    && message.id == sortedMessages.last?.id
-                            ) {
+                            ChatMessageBubble(message: message) {
                                 copyMessageAsMarkdown(message)
                             }
                             .id(message.id)
@@ -128,34 +129,68 @@ struct ChatDetailView: View {
             )
             .padding(.horizontal, 150)
             .padding(.top, 12)
-            .padding(.bottom, contextProgress >= 0.8 ? 0 : 2)
+            .padding(.bottom, contextProgress >= 0.70 ? 0 : 2)
 
-            if contextProgress >= 0.8 {
-                Text("Context nearly full")
+            if contextProgress >= 0.70 {
+                Text("Context almost full — responses may stall. Trim or start a new chat.")
                     .font(.caption2)
                     .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
                     .padding(.bottom, 2)
             }
 
             if let errorText = intelligenceService.errorMessage(for: session) {
                 let retryBlocked = intelligenceService.retryBlockedReason(for: session)
-                HStack {
-                    Text(retryBlocked ?? errorText)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                        .lineLimit(2)
+                let isContextBlocked = intelligenceService.isContextFullBlocked(for: session)
 
-                    Spacer()
+                if isContextBlocked {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(errorText)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
 
-                    Button("Retry") {
-                        Task {
-                            await intelligenceService.retry(in: session, modelContext: modelContext)
+                        HStack(spacing: 12) {
+                            Button(role: .destructive) {
+                                showingTrimConfirmation = true
+                            } label: {
+                                Label("Trim oldest", systemImage: "scissors")
+                                    .font(.footnote)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
+                                startNewChatFromBlocked()
+                            } label: {
+                                Label("Start new chat", systemImage: "square.and.pencil")
+                                    .font(.footnote)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Spacer()
                         }
                     }
-                    .disabled(isGenerating || retryBlocked != nil)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
+                } else {
+                    HStack {
+                        Text(retryBlocked ?? errorText)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                            .lineLimit(2)
+
+                        Spacer()
+
+                        Button("Retry") {
+                            Task {
+                                await intelligenceService.retry(in: session, modelContext: modelContext)
+                            }
+                        }
+                        .disabled(isGenerating || retryBlocked != nil)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.top, 8)
                 }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
             }
 
             HStack(spacing: 8) {
@@ -222,6 +257,18 @@ struct ChatDetailView: View {
         } message: {
             Text("Choose a new title for this chat.")
         }
+        .confirmationDialog(
+            "Trim oldest messages?",
+            isPresented: $showingTrimConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Trim and retry", role: .destructive) {
+                trimAndRetry()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("The oldest exchanges will be permanently removed until the chat fits. This cannot be undone.")
+        }
         .onChange(of: showingRenameAlert) { _, showing in
             if !showing && wasInputFocused {
                 isInputFocused = true
@@ -250,18 +297,6 @@ struct ChatDetailView: View {
                 generationStartedAt = nil
                 elapsedTimerTask?.cancel()
                 elapsedTimerTask = nil
-                // Log the moment the last assistant bubble switches from plain-text
-                // streaming mode to the finalized markdown render. One event per generation.
-                FreezeLogger.shared.log(
-                    "render_mode_switched_to_markdown",
-                    sessionID: session.id
-                )
-            }
-        }
-        .onChange(of: draftMessage) { _, newValue in
-            // Prewarm on first keystroke while not already generating.
-            if newValue.count == 1, !isGenerating {
-                intelligenceService.prewarm(for: session)
             }
         }
         .onDisappear {
@@ -302,6 +337,18 @@ struct ChatDetailView: View {
 
     private func copyMessageAsMarkdown(_ message: ChatMessage) {
         UIPasteboard.general.string = ChatExport.markdown(for: message)
+    }
+
+    private func trimAndRetry() {
+        Task {
+            await intelligenceService.trimOldestExchangesAndRetry(in: session, modelContext: modelContext)
+        }
+    }
+
+    private func startNewChatFromBlocked() {
+        if let newSession = intelligenceService.startNewChatFromBlockedPrompt(in: session, modelContext: modelContext) {
+            onSelectSession?(newSession.id)
+        }
     }
 }
 
@@ -414,7 +461,6 @@ private struct SessionSnapshotView: View {
 
 private struct ChatMessageBubble: View {
     let message: ChatMessage
-    let isStreaming: Bool
     let onCopyAsMarkdown: () -> Void
 
     var body: some View {
@@ -431,11 +477,6 @@ private struct ChatMessageBubble: View {
                     .foregroundStyle(.secondary)
 
                 if isUser {
-                    Text(message.text)
-                } else if isStreaming {
-                    // Plain text during streaming — avoids O(n²) full-text markdown
-                    // re-parsing on the main thread for every incoming fragment.
-                    // Switches to the full Markdown render once generation completes.
                     Text(message.text)
                 } else {
                     Markdown(message.text)

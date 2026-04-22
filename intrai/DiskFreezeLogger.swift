@@ -6,7 +6,7 @@
 import Foundation
 
 final class DiskFreezeLogger {
-    static let shared = DiskFreezeLogger()
+    nonisolated static let shared = DiskFreezeLogger()
 
     private let fileManager = FileManager.default
     private let queue = DispatchQueue(label: "com.johnsonation.intrai.disk-freeze-logger", qos: .utility)
@@ -73,6 +73,73 @@ final class DiskFreezeLogger {
         queue.sync { }
     }
 
+    /// Writes a diagnostic entry to disk from any thread without going through
+    /// `FreezeLogger` (which is `@MainActor`). Used by the GCD generation
+    /// deadline so stall breadcrumbs survive even if MainActor is wedged.
+    ///
+    /// Always flushes synchronously so the entry is durable by the time this
+    /// call returns — callers should assume MainActor may be permanently stuck
+    /// and the user may force-quit within milliseconds.
+    nonisolated func persistDirect(
+        event: String,
+        level: FreezeLogLevel = .info,
+        sessionID: UUID?,
+        generationStamp: UUID?,
+        durationMs: Double?,
+        metadata: [String: String]
+    ) {
+        var threadID: UInt64 = 0
+        pthread_threadid_np(nil, &threadID)
+        let entry = FreezeLogEntry(
+            id: UUID(),
+            timestamp: Date(),
+            event: event,
+            level: level,
+            sessionID: sessionID,
+            generationStamp: generationStamp,
+            durationMs: durationMs,
+            scenePhase: "unknown",
+            memoryWarningCount: 0,
+            threadID: threadID,
+            isMainThread: Thread.isMainThread,
+            metadata: metadata
+        )
+        persist(entry)
+        flush()
+    }
+
+    /// Scans all persisted disk entries for the most recent
+    /// `force_recovery_unreachable_mainactor` marker. Used by ContentView at
+    /// launch to surface the post-abort relaunch banner. Returns nil if no such
+    /// entry exists (happy path).
+    ///
+    /// Reads are queue-synchronized so an in-progress persist cannot produce a
+    /// partial line we fail to parse.
+    nonisolated func latestAbortRecoveryEntry() -> FreezeLogEntry? {
+        queue.sync {
+            guard let diskEntries = try? loadDiskEntries() else { return nil }
+            return diskEntries
+                .filter { $0.event == "force_recovery_unreachable_mainactor" }
+                .max(by: { $0.timestamp < $1.timestamp })
+        }
+    }
+
+    /// Returns true if at least one persisted entry matches the given event
+    /// name and (if provided) sessionID. Queue-synchronized so a concurrent
+    /// persist cannot race the read. Intended for validation scaffolding that
+    /// needs to assert the unified send watchdog armed/disarmed a specific
+    /// send().
+    nonisolated func hasPersistedEvent(_ event: String, sessionID: UUID? = nil) -> Bool {
+        queue.sync {
+            guard let diskEntries = try? loadDiskEntries() else { return false }
+            return diskEntries.contains { entry in
+                guard entry.event == event else { return false }
+                if let sessionID { return entry.sessionID == sessionID }
+                return true
+            }
+        }
+    }
+
     func exportMerged(with memoryEntries: [FreezeLogEntry], metadata: [String: String]) throws -> URL {
         try queue.sync {
             try ensureDirectoriesExist()
@@ -137,44 +204,61 @@ final class DiskFreezeLogger {
             "save_user_message_failed",
             "transcript_build_start",
             "transcript_build_end",
+            "transcript_pruned",
             "context_progress_evaluated",
-            "stream_initialized",
-            "startup_watchdog_armed",
-            "startup_watchdog_checked",
-            "mid_stream_watchdog_spawned",
-            "mid_stream_watchdog_armed",
-            "mid_stream_watchdog_tick",
-            "first_fragment_received",
-            "fragment_sample",
-            "mid_stream_stall_detected",
-            // Inner detached-stream lifecycle: critical for model-hang vs UI-lock disambiguation.
-            // These events survive force-quit only when persisted here AND flushed immediately.
-            "inner_stream_started",
-            "inner_stream_finished",
-            "inner_stream_error",
-            "stream_completed",
-            "save_assistant_message_end",
-            "generation_timeout",
-            "generation_stalled",
+            // Non-streaming generation lifecycle (0.2.105+)
+            "generation_started",
+            "generation_finished",
             "generation_cancelled",
             "generation_failed",
+            "generation_timeout",
+            "generation_stalled",
+            "generation_deadline_fired",
+            "generation_grace_expired",
+            "force_recovered_from_stall",
+            "force_recovery_skipped_stale",
+            "force_recovery_unreachable_mainactor",
+            "send_blocked_context_full",
+            "context_trim_user_action",
+            "context_start_new_chat_user_action",
+            "heartbeat_scheduled",
+            "heartbeat_ran",
+            "save_assistant_message_end",
             "save_after_failure_failed",
-            "watchdog_timeout_fired",
             "autoname_started",
             "autoname_skipped",
+            "autoname_scheduled",
+            "autoname_cancelled",
+            "autoname_cancelled_by_new_send",
+            "autoname_deadline_fired",
+            "autoname_result_dropped_after_deadline",
             "autoname_model_unavailable",
             "autoname_model_call_started",
-            "autoname_model_call_detached_started",
             "autoname_model_call_finished",
             "autoname_model_call_failed",
             "autoname_finished",
-            // Phase 1: Retry governance events
+            // Retry governance events
             "retry_cooldown_started",
             "retry_cooldown_ended",
             "retry_blocked_cooldown",
             "retry_blocked_circuit_open",
             "model_circuit_opened",
-            "model_circuit_closed"
+            "model_circuit_closed",
+            // Phase 4 — bounded generation, proactive wedge detection,
+            // post-abort banner.
+            "generation_max_tokens",
+            "generation_capped",
+            "generation_exceeded_context_window",
+            "generation_early_cancel_wedge_detected",
+            "abort_recovery_banner_shown",
+            "runtime_limits_loaded",
+            "runtime_limits_load_failed",
+            "runtime_limits_unavailable",
+            // Phase 4 hotfix (0.2.111) — unified send watchdog that arms at
+            // send_start and covers pre-flight.
+            "send_watchdog_armed",
+            "send_watchdog_disarmed",
+            "preflight_hang_detected"
         ]
         return persistedEvents.contains(event)
     }

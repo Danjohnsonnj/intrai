@@ -20,6 +20,10 @@ struct ContentView: View {
     @State private var renameSessionID: UUID?
     @State private var renameDraftTitle = ""
     @State private var showingMemorySettings = false
+    @State private var abortRecoveryBannerVisible = false
+    @State private var abortRecoveryBannerEntryID: UUID? = nil
+
+    private let acknowledgedAbortKey = "intrai.acknowledgedAbortRecoveryEntryID"
 
     private var selectedSession: ChatSession? {
         guard let selectedSessionID else {
@@ -32,10 +36,21 @@ struct ContentView: View {
         NavigationSplitView {
             sidebar
         } detail: {
-            if let selectedSession {
-                ChatDetailView(session: selectedSession, intelligenceService: intelligenceService)
-            } else {
-                ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
+            VStack(spacing: 0) {
+                if abortRecoveryBannerVisible {
+                    abortRecoveryBanner
+                }
+                if let selectedSession {
+                    ChatDetailView(
+                        session: selectedSession,
+                        intelligenceService: intelligenceService,
+                        onSelectSession: { newID in
+                            selectedSessionID = newID
+                        }
+                    )
+                } else {
+                    ContentUnavailableView("Select a chat", systemImage: "bubble.left.and.bubble.right")
+                }
             }
         }
         .alert("Rename Chat", isPresented: renameAlertBinding) {
@@ -55,6 +70,14 @@ struct ContentView: View {
             FreezeLogger.shared.start()
             FreezeLogger.shared.setScenePhase(scenePhaseString(scenePhase))
             handlePendingIntent()
+            // Fire-and-forget: cache the live `SystemLanguageModel.default.contextSize`
+            // so the pre-flight gate and risk banner scale with the model. Hotfix
+            // 0.2.111 removed the `tokenCount(for:)` call that used to also run
+            // here — it could wedge the same way `respond(to:)` can.
+            Task.detached(priority: .utility) {
+                await AIContextBuilder.loadRuntimeLimits()
+            }
+            checkForPostAbortRecoveryBanner()
         }
         .onChange(of: scenePhase) { _, phase in
             FreezeLogger.shared.setScenePhase(scenePhaseString(phase))
@@ -208,6 +231,72 @@ struct ContentView: View {
             return "unknown"
         }
     }
+
+    // MARK: - Post-abort recovery banner
+
+    @ViewBuilder
+    private var abortRecoveryBanner: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Your last response was cancelled automatically because the model stopped responding. Your chat was preserved.")
+                    .font(.footnote)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button {
+                dismissAbortRecoveryBanner()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.yellow.opacity(0.15))
+        .overlay(
+            Rectangle()
+                .frame(height: 0.5)
+                .foregroundStyle(.separator),
+            alignment: .bottom
+        )
+    }
+
+    /// Reads the disk log for the most recent `force_recovery_unreachable_mainactor`
+    /// entry. If it's newer than whatever the user has already dismissed
+    /// (tracked in UserDefaults by that entry's UUID), surface the banner.
+    /// Runs on a detached task so we never block the launch path on disk IO.
+    private func checkForPostAbortRecoveryBanner() {
+        let acknowledgedID = UserDefaults.standard.string(forKey: acknowledgedAbortKey)
+        Task.detached(priority: .utility) {
+            guard let entry = DiskFreezeLogger.shared.latestAbortRecoveryEntry() else { return }
+            let entryIDString = entry.id.uuidString
+            if acknowledgedID == entryIDString { return }
+            await MainActor.run {
+                abortRecoveryBannerEntryID = entry.id
+                abortRecoveryBannerVisible = true
+                FreezeLogger.shared.log(
+                    "abort_recovery_banner_shown",
+                    level: .warning,
+                    metadata: [
+                        "abortEntryID": entryIDString,
+                        "abortEntryTimestamp": ISO8601DateFormatter().string(from: entry.timestamp)
+                    ]
+                )
+            }
+        }
+    }
+
+    private func dismissAbortRecoveryBanner() {
+        if let id = abortRecoveryBannerEntryID {
+            UserDefaults.standard.set(id.uuidString, forKey: acknowledgedAbortKey)
+        }
+        abortRecoveryBannerVisible = false
+    }
 }
 
 private struct MemorySettingsView: View {
@@ -222,7 +311,7 @@ private struct MemorySettingsView: View {
     @State private var diagnosticsExportError: String?
     @State private var showingContextWarning = false
 
-    private let diagnosticsBuildVersion = "0.2.104"
+    private let diagnosticsBuildVersion = "0.2.111"
 
     private var combinedTokenEstimate: Int {
         let combined = systemPromptDraft + "\n" + factsDraft
