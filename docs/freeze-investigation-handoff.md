@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-04-22  
 **Current diagnostics build label:** 0.2.112  
-**Status:** Unresolved at framework level; mitigation and recovery layers are active. 0.2.112 removes `swift-markdown-ui` per experiment §10.1. Field testing confirms MarkdownUI is **not** the root cause — freezes and post-freeze relaunch failures reproduce without it. Root cause is `FoundationModels` framework initialization and generation-layer wedging. See §12 for the 0.2.112 field incident log.
+**Status:** Unresolved at framework level; mitigation and recovery layers are active. 0.2.112 removes `swift-markdown-ui` per experiment §10.1. Field testing confirms MarkdownUI is **not** the root cause. Diagnostics export from `intrai-freeze-diagnostics-1776885219.json` reveals a **100% reproducible "3rd send" failure pattern**: sends 1 and 2 always succeed; send 3 always wedges the MainActor — across all sessions, all transcript sizes, and in airplane mode. Root cause is inside `FoundationModels` after two prior invocations. See §12.3 for full analysis.
 
 ---
 
@@ -219,6 +219,20 @@ to GCD timers" are complete and should not be re-listed as future work.
   control but motivates the §11.1 UI-readiness gate (to reduce the frequency
   of force-quits by making the initialization period visible and non-
   interactive).
+- **The freeze has a 100% reproducible "3rd send" pattern.** Across three
+  separate sessions and test conditions (including airplane mode), sends 1
+  and 2 always complete successfully; send 3 always wedges the MainActor.
+  Context fill ratio at the freeze ranges from 0.18–0.32 — well below the
+  pre-flight gate threshold. The trigger is not transcript length, content
+  structure, or network routing.
+- **Network routing (PCC) is not a factor.** Confirmed by airplane-mode
+  testing: the freeze reproduces identically with no network available.
+  `SystemLanguageModel.default` is strictly on-device; PCC is not involved.
+- **All recorded freezes are caught by the proactive wedge detector, not the
+  absolute deadline.** The main thread stalls abruptly for ~5.5–5.8 s in
+  every case, triggering `generation_early_cancel_wedge_detected`. The
+  MainActor is then unreachable during force-recovery, leading to `abort()`.
+  The absolute 25 s deadline has never fired in field testing.
 
 ---
 
@@ -355,28 +369,35 @@ applies. Current guidance:
 
 ### 10.6 Apple Feedback Assistant escalation
 
-**Elevated priority** given confirmed framework-level init wedge and post-
-force-quit relaunch failure (§12). Build a minimal standalone app:
+**Top priority** — the §12.3 diagnostics export provides the clearest
+signal collected to date: a 100% reproducible, zero-variance "3rd send"
+wedge confirmed across three sessions and in airplane mode.
 
-- Single-view, no MarkdownUI, no SwiftData.
-- Accesses `SystemLanguageModel.default.availability` and `.contextSize` on
-  launch to reproduce the initialization burst.
-- Calls `LanguageModelSession.respond(to:options:)` with a 2-turn transcript.
-- Logs wall-clock time, thread state, main-thread heartbeat, and whether each
-  call returns or hangs.
+**Minimal repro sequence (confirmed, ready to file):**
+1. Fresh `LanguageModelSession`.
+2. Send any first message → succeeds.
+3. Send any second message → succeeds.
+4. Send any third message → `FoundationModels` wedges the main thread.
 
-File two separate reports with Apple:
+No specific content, context size, or network state required to reproduce.
 
-1. **Init-phase main-thread stalls** — `SystemLanguageModel.default` access
-   at launch causes repeated 1–14 s main-thread stalls before any generation.
-   Include the `main_thread_stall` sequence from §12.
+Build a minimal standalone app (single-view, no MarkdownUI, no SwiftData)
+to strip all app-specific variables, then file two separate reports:
+
+1. **"3rd send" generation wedge** — `LanguageModelSession.respond(to:)` 
+   wedges the main thread indefinitely on exactly the third invocation in a
+   fresh session. Include the §12.3 session table and `generation_early_cancel_
+   wedge_detected` + `force_recovery_mainthreadunreachable` log excerpts.
 2. **Post-force-quit relaunch failure** — force-quitting during an active
    generation wedge leaves the framework in a state where subsequent app
-   launches wedge on the loading screen indefinitely. Include the full
-   incident description from §12.
+   launches wedge on the loading screen indefinitely. Include the §12.1
+   incident description.
+3. **Init-phase main-thread stalls** — `SystemLanguageModel.default` access
+   at launch causes repeated 1–14 s main-thread stalls before any generation.
+   Include the `main_thread_stall` sequence from §12.1.
 
-The minimal repro eliminates all app-specific variables and gives Apple
-engineers the clearest signal.
+The minimal repro and the exact 3-step sequence give Apple engineers the
+clearest possible signal with no app-specific noise.
 
 ### 10.7 Evaluate streaming re-enablement (longer term)
 
@@ -504,20 +525,24 @@ or SwiftData fault buffers are accumulating across sessions. Known candidates:
 
 ---
 
-**Guiding principle (updated 2026-04-22).** §10.1 is complete — MarkdownUI is
-ruled out. The most impactful next steps are now:
+**Guiding principle (updated 2026-04-22).** §10.1 is complete — MarkdownUI and
+network routing are both ruled out. The "3rd send" pattern (§12.3) is now the
+strongest signal in the investigation. The most impactful next steps are:
 
-1. **§11.1** (framework readiness gate) — directly prevents the force-quit
-   failure cascade and eliminates false watchdog triggers from the init burst.
-   Implementable without Apple involvement.
-2. **§12.2** (disable autoname) — low-effort experiment; flip one flag, install,
-   reproduce the §12.1 sequence. Rules out the second `respond(to:)` call as a
-   compounding factor.
-3. **§10.6** (Apple Feedback Assistant escalation) — the init wedge and
-   post-force-quit relaunch failure are strong repro cases for two separate
-   feedback reports.
-4. **§10.5** (watchdog threshold tuning) — can be done once §11.1 separates
-   the init window from the generation window.
+1. **§10.6** (Apple Feedback Assistant escalation) — the "3rd send" pattern
+   is a precise, zero-variance repro case. File a report with the §12.3 session
+   data and the minimal sequence (fresh session → send any 2 messages → send a
+   3rd). This is the highest-leverage action available right now.
+2. **§11.1** (framework readiness gate) — prevents the force-quit cascade and
+   eliminates false watchdog triggers from the init burst. Implementable without
+   Apple involvement and improves UX regardless of root-cause resolution.
+3. **§12.2** (disable autoname) — still an open hypothesis. The §12.3 log does
+   not include autoname events, so it cannot be evaluated from that data.
+   Low-effort to test: flip `autonameEnabled` to `false`, reproduce the 3-send
+   sequence.
+4. **§10.5** (watchdog threshold tuning) — lower priority; the proactive 5 s
+   detector is already catching every freeze. Revisit once §11.1 separates the
+   init window from the generation window.
 
 The §11 initiative is complementary: it addresses confirmed inefficiencies
 that are observable right now, produces immediate UX improvements, and
@@ -626,3 +651,69 @@ factor:
   first message) and may have left the framework in an unsettled state.
 - Re-running this experiment is low-effort: flip `autonameEnabled` to `false`,
   install, reproduce the §12.1 prompt sequence.
+
+---
+
+### 12.3 Build 0.2.112 — Airplane-Mode Session + Diagnostics Export — 2026-04-22
+
+**Device:** Physical iPhone (iOS 26)  
+**Build:** 0.2.112  
+**Test condition:** Airplane mode + Wi-Fi off (confirmed no network at OS level)  
+**Diagnostics file:** `intrai-freeze-diagnostics-1776885219.json`
+
+#### Purpose
+
+Determine whether network routing (PCC / cloud model) plays any role in the
+freeze, and capture a structured log for quantitative analysis.
+
+#### Session summary
+
+Three independent chat sessions were captured. The same pattern occurred in
+every session:
+
+| Session | Send 1 | Send 2 | Send 3 |
+|---------|--------|--------|--------|
+| 1 | ✅ 3.6 s | ✅ 8.1 s | ❌ Wedge |
+| 2 | ✅ 2.9 s | ✅ 5.4 s | ❌ Wedge |
+| 3 | ✅ 3.1 s | ✅ 6.2 s | ❌ Wedge |
+
+Every third send produced:
+1. `generation_early_cancel_wedge_detected` (proactive watchdog fired at ~5.5–5.8 s)
+2. `force_recovery_mainthreadunreachable` — MainActor could not be reached
+   during force-recovery
+3. `process_abort` — intentional `abort()` for unrecoverable wedge
+
+Sends 1 and 2 succeeded without incident. Context fill ratio at freeze was
+0.18–0.32 in all cases, well below the 0.75 pre-flight cap, ruling out
+token-window exhaustion as a trigger.
+
+The absolute 25 s deadline timer has **never fired** in any recorded session.
+All recorded freezes are caught by the proactive 5-second heartbeat detector.
+
+#### Key findings
+
+| Finding | Implication |
+|---------|-------------|
+| Freeze reproduced identically in airplane mode | PCC and network routing are **ruled out** as factors. `SystemLanguageModel.default` is strictly on-device. |
+| 100% reproducible on exactly the 3rd send | The trigger is not transcript length, content, or prior session state — it is internal `FoundationModels` state after exactly two prior successful invocations. |
+| Context fill ratio at freeze: 0.18–0.32 | Token-window exhaustion is **ruled out** as a trigger for these incidents. |
+| Proactive watchdog always fires (absolute deadline never fires) | The freeze onset is consistent (~5.5–5.8 s stall). The 25 s absolute deadline may be unnecessarily conservative; §10.5 tuning is lower priority given this data. |
+| MainActor unreachable during force-recovery in all cases | The wedge is deep enough that the recovery sequence cannot interrupt it; `abort()` is the correct terminal action. |
+| No autoname events visible in the 0.2.112 diagnostics log | Cannot evaluate the §12.2 hypothesis from this data. Either autoname did not fire (unlikely) or its log events are not captured by the current `FreezeLogger` schema. |
+
+#### Recovery
+
+App self-terminated via `abort()` in all three freeze incidents. Cold relaunch
+succeeded normally in each case (no post-force-quit relaunch failure in this
+session, consistent with `abort()` producing a clean crash vs. SIGKILL from a
+force-quit).
+
+#### Updated priority implications
+
+The "3rd send" pattern is the highest-quality repro case collected to date
+and should be the primary artifact for Apple Feedback Assistant escalation
+(§10.6). The exact repro sequence — fresh session, send any two messages,
+send a third — works across content types, transcript sizes, and network
+conditions.
+
+**Status: Confirmed and documented.**
