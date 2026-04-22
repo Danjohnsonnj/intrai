@@ -32,7 +32,7 @@ Typical healthy path:
 1. User sends a prompt.
 2. App performs pre-flight transcript/context checks.
 3. Model returns one complete response block.
-4. Assistant message is saved and rendered as Markdown.
+4. Assistant message is saved and rendered as plain text (selectable).
 
 Failure-handling path:
 
@@ -320,8 +320,8 @@ exported logs. Suggested events:
   `ChatMessageBubble`.
 
 The delta between these two events is the MainActor time consumed by SwiftUI
-layout + MarkdownUI parsing. If this delta is consistently > 1 s, it confirms
-the rendering layer as a bottleneck independent of the generation path.
+layout. If this delta is consistently > 1 s, it confirms the rendering layer
+as a bottleneck independent of the generation path.
 
 ### 10.4 Controlled stimulus testing for generation wedges
 
@@ -510,10 +510,13 @@ ruled out. The most impactful next steps are now:
 1. **§11.1** (framework readiness gate) — directly prevents the force-quit
    failure cascade and eliminates false watchdog triggers from the init burst.
    Implementable without Apple involvement.
-2. **§10.6** (Apple Feedback Assistant escalation) — the init wedge and
+2. **§12.2** (disable autoname) — low-effort experiment; flip one flag, install,
+   reproduce the §12.1 sequence. Rules out the second `respond(to:)` call as a
+   compounding factor.
+3. **§10.6** (Apple Feedback Assistant escalation) — the init wedge and
    post-force-quit relaunch failure are strong repro cases for two separate
    feedback reports.
-3. **§10.5** (watchdog threshold tuning) — can be done once §11.1 separates
+4. **§10.5** (watchdog threshold tuning) — can be done once §11.1 separates
    the init window from the generation window.
 
 The §11 initiative is complementary: it addresses confirmed inefficiencies
@@ -591,3 +594,35 @@ after force-quit; required device reboot to recover.
 
 Device reboot cleared the wedged Neural Engine state and restored normal
 launch behavior.
+
+---
+
+### 12.2 Build 0.2.113 (attempted) — 2026-04-22
+
+**Hypothesis:** The autoname feature fires a second `respond(to:)` call
+immediately after the first user message completes. If the `FoundationModels`
+framework has not fully settled from the primary generation, a concurrent or
+rapid-successive invocation could compound the wedge or trigger a new one.
+Disabling autoname would isolate whether the second model call is a
+contributing factor.
+
+**What was done:** `autonameEnabled` flag added to `IntelligenceService.swift`
+set to `false`, guarding the single `scheduleAutonameIfNeeded(...)` call site.
+`diagnosticsBuildVersion` bumped to `0.2.113`.
+
+**Outcome:** The change was reverted before field testing could be completed
+— the build did not reach the device in a state where the experiment could
+be evaluated. Changes were rolled back via `git`.
+
+**Status: Inconclusive — not yet tested.**
+
+The hypothesis remains open. Autoname is still a plausible compounding
+factor:
+
+- It fires a `respond(to:)` call with a fresh `LanguageModelSession`
+  approximately 1 turn after the primary generation finishes.
+- The first confirmed freeze in §12.1 occurred on the second user message,
+  which is the same exchange where autoname would have already run (from the
+  first message) and may have left the framework in an unsettled state.
+- Re-running this experiment is low-effort: flip `autonameEnabled` to `false`,
+  install, reproduce the §12.1 prompt sequence.
